@@ -1,0 +1,110 @@
+[
+  {
+    "name": "Elara Thornwood",
+    "traits": ["curious", "shy", "loves stargazing"],
+    "premise": "Arrived in the village recently after leaving her home in the mountains. Searching for something she can't name.",
+    "spriteColor": "#6a4ecf",
+    "homeCottage": "cottage_1",
+    "startX": 25,
+    "startY": 34
+  },
+  {
+    "name": "Bren Hollowell",
+    "traits": ["grumpy", "meticulous", "secretly generous"],
+    "premise": "A semi-retired baker who wakes before dawn every day. Lost someone important years ago and has not spoken of it since.",
+    "spriteColor": "#c08040",
+    "homeCottage": "cottage_1",
+    "startX": 3,
+    "startY": 10
+  },
+  {
+    "name": "Seren Vale",
+    "traits": ["warm", "talkative", "incurably nosy"],
+    "premise": "The heart of the tavern crowd. Knows everyone's business but is surprisingly good at keeping the important secrets.",
+    "spriteColor": "#e05080",
+    "homeCottage": "cottage_2",
+    "startX": 3,
+    "startY": 17
+  },
+  {
+    "name": "Kael Mornshade",
+    "traits": ["quiet", "observant", "haunted"],
+    "premise": "A traveler who stopped here one winter and never left. Does not say where he came from. Sketches strangers on scraps of parchment.",
+    "spriteColor": "#3a3a4a",
+    "homeCottage": "cottage_2",
+    "startX": 28,
+    "startY": 34
+  },
+  {
+    "name": "Mira Quillweaver",
+    "traits": ["studious", "idealistic", "easily flustered"],
+    "premise": "The village librarian. Believes every question has an answer hidden somewhere in a book. Has a crush she won't admit to.",
+    "spriteColor": "#60408a",
+    "homeCottage": "cottage_3",
+    "startX": 9,
+    "startY": 5
+  },
+  {
+    "name": "Rowan Greenhaft",
+    "traits": ["practical", "dry wit", "steady"],
+    "premise": "The village's tinker. Can fix almost anything but cannot fix what he feels about growing older alone.",
+    "spriteColor": "#6b4226",
+    "homeCottage": "cottage_3",
+    "startX": 13,
+    "startY": 10
+  },
+  {
+    "name": "Nim Brightbrook",
+    "traits": ["excitable", "reckless", "big-hearted"],
+    "premise": "The youngest adult in the village. Wants to do something grand but has not decided what yet. Challenges everyone to everything.",
+    "spriteColor": "#d4a020",
+    "homeCottage": "cottage_4",
+    "startX": 20,
+    "startY": 19
+  },
+  {
+    "name": "Talia Emberfell",
+    "traits": ["serene", "perceptive", "a touch melancholic"],
+    "premise": "Keeps the apothecary. Listens more than she speaks. People leave her shop feeling strangely understood.",
+    "spriteColor": "#80c060",
+    "homeCottage": "cottage_4",
+    "startX": 13,
+    "startY": 17
+  },
+  {
+    "name": "Fenwick Ash",
+    "traits": ["gruff", "loyal", "easily drunk"],
+    "premise": "A former mercenary who claims to be retired. Sometimes stares at the horizon too long. Plays a mean hand of cards.",
+    "spriteColor": "#7a3030",
+    "homeCottage": "cottage_5",
+    "startX": 4,
+    "startY": 18
+  },
+  {
+    "name": "Lyra Dawnwhisper",
+    "traits": ["dreamy", "kind", "spiritually restless"],
+    "premise": "Was once a priestess of a small shrine that closed. Still prays in the park each morning. Not sure what she believes anymore.",
+    "spriteColor": "#b890d0",
+    "homeCottage": "cottage_5",
+    "startX": 29,
+    "startY": 7
+  },
+  {
+    "name": "Orrin Cobblestep",
+    "traits": ["methodical", "stubborn", "secretly sentimental"],
+    "premise": "The village caretaker. Sweeps the plaza before anyone else wakes. Notices which agents are avoiding each other.",
+    "spriteColor": "#4a6a4a",
+    "homeCottage": "cottage_1",
+    "startX": 20,
+    "startY": 20
+  },
+  {
+    "name": "Wren Applebough",
+    "traits": ["cheerful", "naive", "resilient"],
+    "premise": "Grew up here. Has never left. Everyone assumes she is simple, but she remembers everything anyone has ever told her.",
+    "spriteColor": "#e09050",
+    "homeCottage": "cottage_2",
+    "startX": 21,
+    "startY": 20
+  }
+]
