@@ -1,41 +1,137 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
-# dependencies
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Diagnostic reports (https://nodejs.org/api/report.html)
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage / testing
+lib-cov
+coverage
+*.lcov
+.nyc_output
+
+# Grunt intermediate storage
+.grunt
+
+# Bower
+bower_components
+
+# node-waf configuration
+.lock-wscript
+
+# Compiled binary addons
+build/Release
+
+# Dependencies
 /node_modules
+node_modules/
+jspm_packages/
 /.pnp
 .pnp.*
+
+# Snowpack
+web_modules/
+
+# TypeScript cache
+*.tsbuildinfo
+next-env.d.ts
+
+# npm / yarn / eslint / stylelint caches
+.npm
+.eslintcache
+.stylelintcache
+
+# REPL history
+.node_repl_history
+
+# npm pack output
+*.tgz
+
+# Yarn
+.yarn-integrity
 .yarn/*
 !.yarn/patches
 !.yarn/plugins
 !.yarn/releases
+!.yarn/sdks
 !.yarn/versions
 
-# testing
-/coverage
+# dotenv environment variable files
+.env
+.env.*
+!.env.example
 
-# next.js
+# Parcel cache
+.cache
+.parcel-cache
+
+# Next.js build output
+.next
 /.next/
+out
 /out/
 
-# production
+# Production build
 /build
+
+# Nuxt
+.nuxt
+dist
+
+# Gatsby
+.cache/
+
+# VuePress / VitePress
+.vuepress/dist
+.temp
+**/.vitepress/dist
+**/.vitepress/cache
+
+# SvelteKit
+.svelte-kit/
+
+# Docusaurus
+.docusaurus
+
+# Serverless
+.serverless/
+
+# FuseBox
+.fusebox/
+
+# DynamoDB Local
+.dynamodb/
+
+# Firebase
+.firebase/
+
+# TernJS
+.tern-port
+
+# VSCode extension testing
+.vscode-test
+
+# Vite timestamp files
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
 
 # misc
 .DS_Store
 *.pem
 
-# debug
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
-
-# env files (can opt-in for committing if needed)
-.env*
-
-# vercel
+# Vercel
 .vercel
-
-# typescript
-*.tsbuildinfo
-next-env.d.ts
