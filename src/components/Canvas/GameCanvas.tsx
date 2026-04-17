@@ -72,6 +72,7 @@ export default function GameCanvas() {
   const agentsRef = useRef<AgentRender[]>([]);
   const tickIntervalMsRef = useRef<number>(SPEED_INTERVALS_MS[1]);
   const tickingRef = useRef(false); // prevents overlapping tick requests
+  const simStateRef = useRef<SimState | null>(null); // readable inside rAF loop
 
   const [agentCount, setAgentCount] = useState<number | null>(null);
   const [stateError, setStateError] = useState<string | null>(null);
@@ -158,6 +159,7 @@ export default function GameCanvas() {
         setAgentCount(agentsRef.current.length);
         if (data.state) {
           setSimState(data.state);
+          simStateRef.current = data.state;
           setPaused(!!data.state.is_paused);
         }
       } catch (e) {
@@ -185,6 +187,7 @@ export default function GameCanvas() {
       setAgentCount(agentsRef.current.length);
       if (stateData.state) {
         setSimState(stateData.state);
+        simStateRef.current = stateData.state;
         setPaused(!!stateData.state.is_paused);
       }
     } catch (e) {
@@ -216,7 +219,10 @@ export default function GameCanvas() {
         }
         const data = await res.json();
         mergeAgents(data.agents ?? [], performance.now());
-        if (data.state) setSimState(data.state);
+        if (data.state) {
+          setSimState(data.state);
+          simStateRef.current = data.state;
+        }
       } catch (e) {
         setStateError(String(e).slice(0, 200));
       } finally {
@@ -451,6 +457,34 @@ export default function GameCanvas() {
         }
       }
 
+      // ── Day/night overlay ──────────────────────────────────────────────────
+      const timeOfDay = simStateRef.current?.time_of_day ?? "morning";
+      const nightAlpha: Record<string, number> = {
+        morning: 0,
+        midday: 0,
+        afternoon: 0.08,
+        evening: 0.28,
+        night: 0.52,
+      };
+      const alpha = nightAlpha[timeOfDay] ?? 0;
+      if (alpha > 0) {
+        ctx.fillStyle = `rgba(10, 15, 40, ${alpha})`;
+        ctx.fillRect(0, 0, CANVAS_PIXEL_W, CANVAS_PIXEL_H);
+      }
+      // Warm lamppost glows at evening/night
+      if (alpha >= 0.28) {
+        for (const entry of tilemap.buildingEntries) {
+          // Glow from building windows
+          const wx = (entry.x + entry.width / 2) * TILE_SIZE;
+          const wy = entry.y * TILE_SIZE + 8;
+          const grd = ctx.createRadialGradient(wx, wy, 0, wx, wy, TILE_SIZE * 2);
+          grd.addColorStop(0, "rgba(255, 200, 80, 0.18)");
+          grd.addColorStop(1, "rgba(255, 200, 80, 0)");
+          ctx.fillStyle = grd;
+          ctx.fillRect(wx - TILE_SIZE * 2, wy - TILE_SIZE * 2, TILE_SIZE * 4, TILE_SIZE * 4);
+        }
+      }
+
       rafId = requestAnimationFrame(render);
     };
 
@@ -549,7 +583,7 @@ export default function GameCanvas() {
         tabIndex={0}
       />
       <p className="text-xs text-gray-500 mt-2 font-mono">
-        Chunk 3 — Agent Movement & Pathfinding
+        Chunk 4 — Memory System & AI Decision-Making
       </p>
     </div>
   );

@@ -215,3 +215,67 @@ Chunk 3 is pure movement, no LLM calls.
 - **Tick polling**: `setInterval` fires `POST /api/simulation/tick` at the selected speed while unpaused and agents exist. First tick fires immediately on play.
 - **Agent interpolation**: each agent has `prevX/prevY` (position when tick arrived) and `current_x/current_y` (new target). Visual position is linearly interpolated over one tick interval: `t = (now - tickArrivedAt) / tickIntervalMs`, clamped to [0, 1]. Movement direction derived from the delta.
 - Agents inside a building are hidden (sprite not drawn, name label not drawn).
+
+---
+
+## Chunk 4: Memory System & AI Decision-Making
+
+### New / changed files
+
+```
+src/
+├── app/api/simulation/tick/route.ts   # Full rewrite — LLM decision pipeline
+├── lib/openai.ts                      # ActionDecisionSchema updated, InternalThoughtSchema added
+supabase/migrations/
+└── 003_memory_retrieval.sql           # match_memories(embedding, agent_id, n) RPC function
+```
+
+### Migration 003 — `match_memories` RPC
+
+```sql
+CREATE OR REPLACE FUNCTION match_memories(
+  query_embedding vector(1536), p_agent_id UUID, match_count INT)
+RETURNS TABLE (id UUID, sim_tick INT, type TEXT, content TEXT, importance REAL, relevance FLOAT)
+```
+
+Returns the nearest memories by cosine similarity. Server re-ranks by:
+`score = 0.3 × recency(0.995^Δtick) + 0.3 × relevance + 0.4 × importance`
+
+### Tick pipeline (Chunk 4 — AI-driven)
+
+**Per-tick phases (for agents who need a new decision):**
+
+1. **Classify agents**: walking (advance path), exiting building, night-go-home override, or needing a full AI decision cycle.
+2. **Build observations** (pure JS): `"[Day N, morning, tick T] I am near The Gilded Quill. Nearby: Seren Vale, Kael Mornshade."`
+3. **Embed** all observations in parallel (`text-embedding-3-small`) — `Promise.allSettled`.
+4. **Retrieve memories + importance scoring** in parallel:
+   - `match_memories` RPC → top 30 by cosine similarity, re-ranked to top 10 by recency+relevance+importance.
+   - Batch importance scoring of all new observations: one `gpt-4o-mini` call returns a score per observation.
+5. **Action decisions** (`gpt-4-turbo`, parallel, `allSettled`): receives backstory + traits + observation + top-10 memories → returns `{ chosen_action, target_building, reasoning }`.
+6. **Internal thoughts** (25% chance when idle): `gpt-4o-mini` generates a first-person thought stored as `internal_thought` memory.
+7. **Store memories** (observations + thoughts) with embeddings in Supabase.
+8. **Execute actions**: walk agents advance a tile, AI-decided agents get A* paths set, idle agents get `next_decision_tick` deferred.
+9. **Update `simulation_state`**.
+
+**Night override**: when `time_of_day === "night"`, agents not at home skip the LLM entirely and get a direct `go_home` A* path computed server-side.
+
+**Graceful degradation**: if any LLM call fails (`allSettled`), that agent falls back to random A* wander. Importance scoring failure defaults all scores to 0.3.
+
+### Day/night visual overlay
+
+In the `requestAnimationFrame` loop, after drawing all sprites, a semi-transparent dark blue rectangle is composited over the canvas:
+
+| Time of day | Alpha |
+|-------------|-------|
+| morning / midday | 0 |
+| afternoon | 0.08 |
+| evening | 0.28 |
+| night | 0.52 |
+
+At evening/night, warm radial gradients are drawn from each building (window glow effect).
+
+### Setup required (one-time for Chunk 4)
+
+1. Run `supabase/migrations/003_memory_retrieval.sql` in Supabase SQL Editor.
+2. Ensure `OPENAI_API_KEY` is in `.env.local`.
+3. Without OpenAI configured, agents degrade to Chunk 3 random wander (no crash).

@@ -3,23 +3,39 @@ import { serverClient, AgentRow } from "@/lib/supabase";
 import { generateTileMap } from "@/data/tilemap";
 import { findPath } from "@/engine/pathfinding";
 import { BUILDING_ID_TO_KEY, ENTERABLE_BUILDING_IDS } from "@/engine/buildings";
+import {
+  callJSON, embed,
+  MODEL_HIGH, MODEL_LOW,
+  ActionDecisionSchema, ImportanceScoresSchema, InternalThoughtSchema,
+} from "@/lib/openai";
+import { TileMap } from "@/lib/types";
 
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
-// Chunk 3: random wander + A* pathfinding. No AI calls yet.
-// One tick advances every agent by at most one tile.
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
 
 const TICKS_PER_DAY = 96;
+const OBSERVATION_RADIUS = 6; // tiles — agents perceive others within this range
+const MEMORY_RETRIEVE_COUNT = 30; // top-N by cosine similarity before re-ranking
+const MEMORY_CONTEXT_COUNT = 10; // final top-N fed into decision prompt
+const INTERNAL_THOUGHT_CHANCE = 0.25; // probability when agent is idle
 
-type AgentUpdate = {
-  id: string;
-  current_x?: number;
-  current_y?: number;
-  current_building?: string | null;
-  path?: { x: number; y: number }[] | null;
-  next_decision_tick?: number;
-  status?: string;
-};
+// Weighted scores for memory re-ranking (must sum to ~1)
+const W_RECENCY = 0.3;
+const W_RELEVANCE = 0.3;
+const W_IMPORTANCE = 0.4;
+const RECENCY_DECAY = 0.995; // per-tick exponential decay
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+function rand(n: number): number {
+  return Math.floor(Math.random() * n);
+}
 
 function timeOfDayForTick(tick: number):
   "morning" | "midday" | "afternoon" | "evening" | "night" {
@@ -31,15 +47,196 @@ function timeOfDayForTick(tick: number):
   return "night";
 }
 
-function rand(n: number): number {
-  return Math.floor(Math.random() * n);
+/** Distance between two positions (Chebyshev, good for tile proximity). */
+function dist(ax: number, ay: number, bx: number, by: number): number {
+  return Math.max(Math.abs(ax - bx), Math.abs(ay - by));
 }
+
+/** Human-readable location description for the prompt. */
+function describeLocation(agent: AgentRow, tilemap: TileMap): string {
+  if (agent.current_building) {
+    const entry = tilemap.buildingEntries.find(
+      (b) => BUILDING_ID_TO_KEY[b.id] === agent.current_building,
+    );
+    return entry ? `inside ${entry.name}` : `inside a building`;
+  }
+  // Nearest named area
+  let nearest: { name: string; d: number } | null = null;
+  for (const b of tilemap.buildingEntries) {
+    const d = dist(agent.current_x, agent.current_y, b.entryX, b.entryY);
+    if (!nearest || d < nearest.d) nearest = { name: b.name, d };
+  }
+  if (nearest && nearest.d <= 4) return `near ${nearest.name}`;
+  return `somewhere in the village (tile ${agent.current_x},${agent.current_y})`;
+}
+
+/** Find the entry tile for a building key. */
+function buildingEntry(key: string | null, tilemap: TileMap) {
+  if (!key) return null;
+  for (const b of tilemap.buildingEntries) {
+    if (BUILDING_ID_TO_KEY[b.id] === key) return b;
+  }
+  return null;
+}
+
+/** Build the observation string an agent generates this decision cycle. */
+function buildObservation(
+  agent: AgentRow,
+  allAgents: AgentRow[],
+  tilemap: TileMap,
+  tick: number,
+  timeOfDay: string,
+  day: number,
+): string {
+  const location = describeLocation(agent, tilemap);
+  const nearby = allAgents
+    .filter(
+      (a) =>
+        a.id !== agent.id &&
+        !a.current_building &&
+        dist(agent.current_x, agent.current_y, a.current_x, a.current_y) <=
+          OBSERVATION_RADIUS,
+    )
+    .map((a) => a.name);
+
+  const nearbyStr =
+    nearby.length === 0
+      ? "Nobody is nearby."
+      : `Nearby: ${nearby.join(", ")}.`;
+
+  return `[Day ${day}, ${timeOfDay}, tick ${tick}] I am ${location}. ${nearbyStr}`;
+}
+
+type MemoryRow = {
+  id: string;
+  sim_tick: number;
+  type: string;
+  content: string;
+  importance: number;
+  relevance: number;
+};
+
+/** Retrieve and re-rank top memories for an agent using their observation embedding. */
+async function retrieveMemories(
+  agentId: string,
+  embedding: number[],
+  currentTick: number,
+  supabase: ReturnType<typeof serverClient>,
+): Promise<MemoryRow[]> {
+  const { data, error } = await supabase.rpc("match_memories", {
+    query_embedding: embedding,
+    p_agent_id: agentId,
+    match_count: MEMORY_RETRIEVE_COUNT,
+  });
+  if (error || !data) return [];
+
+  return (data as MemoryRow[])
+    .map((m) => ({
+      ...m,
+      score:
+        W_RECENCY * Math.pow(RECENCY_DECAY, currentTick - m.sim_tick) +
+        W_RELEVANCE * m.relevance +
+        W_IMPORTANCE * m.importance,
+    }))
+    .sort((a, b) => (b as typeof b & {score:number}).score - (a as typeof a & {score:number}).score)
+    .slice(0, MEMORY_CONTEXT_COUNT);
+}
+
+/** GPT-4-turbo action decision. */
+async function decideAction(
+  agent: AgentRow,
+  observation: string,
+  memories: MemoryRow[],
+  timeOfDay: string,
+  day: number,
+): Promise<{ chosen_action: string; target_building: string | null; reasoning: string }> {
+  const memoryBlock =
+    memories.length === 0
+      ? "No relevant memories yet."
+      : memories
+          .map((m, i) => `${i + 1}. [${m.type}] ${m.content}`)
+          .join("\n");
+
+  const system = `You are ${agent.name}, a character in a fantasy village simulation.
+Backstory: ${agent.backstory}
+Personality traits: ${agent.traits.join(", ")}.
+Home: ${agent.home_building_id}.
+Always respond with valid JSON only.`;
+
+  const user = `Current observation: ${observation}
+
+Recent relevant memories:
+${memoryBlock}
+
+Available actions:
+- move_to: walk to a building. Set target_building to one of: inn, library, bakery, workshop, apothecary, plaza, park, cottage_1, cottage_2, cottage_3, cottage_4, cottage_5. Set to null to wander freely.
+- idle: stay put and reflect.
+- go_home: return to your cottage.
+
+It is ${timeOfDay} on day ${day}. Based on your personality, backstory, and memories, decide what to do next.
+Respond with JSON: { "chosen_action": "...", "target_building": "..." or null, "reasoning": "..." }`;
+
+  return callJSON({
+    model: MODEL_HIGH,
+    system,
+    user,
+    schema: ActionDecisionSchema,
+    temperature: 0.8,
+    maxTokens: 200,
+  });
+}
+
+/** GPT-4o-mini internal thought for idle agents. */
+async function generateThought(agent: AgentRow, observation: string): Promise<string | null> {
+  try {
+    const result = await callJSON({
+      model: MODEL_LOW,
+      system: `You are ${agent.name}. Personality: ${agent.traits.join(", ")}. Write a single brief internal thought (max 100 words) in first person. Respond with JSON: { "thought": "..." }`,
+      user: `Context: ${observation}\nWhat are you thinking right now?`,
+      schema: InternalThoughtSchema,
+      temperature: 0.9,
+      maxTokens: 80,
+    });
+    return result.thought;
+  } catch {
+    return null;
+  }
+}
+
+/** Batch importance scoring for a list of memory contents (GPT-4o-mini). */
+async function scoreImportance(contents: string[]): Promise<number[]> {
+  if (contents.length === 0) return [];
+  try {
+    const result = await callJSON({
+      model: MODEL_LOW,
+      system: `Rate the long-term significance of each memory for a village character on a scale of 0.0 to 1.0.
+0.0 = trivial routine (walking down a road).
+0.5 = notable event (meeting someone new, learning something).
+1.0 = life-changing (witnessing something extraordinary).
+Respond with JSON: { "scores": [0.0, 0.5, ...] } — one score per memory, in the same order.`,
+      user: contents.map((c, i) => `${i + 1}. ${c}`).join("\n"),
+      schema: ImportanceScoresSchema,
+      temperature: 0.3,
+      maxTokens: 100,
+    });
+    // Clamp and pad/trim to match length
+    const scores = result.scores.map((s) => Math.max(0, Math.min(1, s)));
+    while (scores.length < contents.length) scores.push(0.3);
+    return scores.slice(0, contents.length);
+  } catch {
+    return contents.map(() => 0.3); // fallback: treat all as mildly important
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main handler
+// ─────────────────────────────────────────────────────────────────────────────
 
 export async function POST() {
   const supabase = serverClient();
   const tilemap = generateTileMap();
 
-  // --- Load state ---
+  // Load state + agents (full rows needed for backstory/traits in prompts)
   const [stateRes, agentsRes] = await Promise.all([
     supabase
       .from("simulation_state")
@@ -50,104 +247,223 @@ export async function POST() {
     supabase.from("agents").select("*"),
   ]);
 
-  if (stateRes.error) {
-    return NextResponse.json({ error: stateRes.error.message }, { status: 500 });
-  }
-  if (agentsRes.error) {
-    return NextResponse.json({ error: agentsRes.error.message }, { status: 500 });
-  }
-  if (!stateRes.data) {
-    return NextResponse.json({ error: "World not initialized" }, { status: 409 });
-  }
+  if (stateRes.error) return NextResponse.json({ error: stateRes.error.message }, { status: 500 });
+  if (agentsRes.error) return NextResponse.json({ error: agentsRes.error.message }, { status: 500 });
+  if (!stateRes.data) return NextResponse.json({ error: "World not initialized" }, { status: 409 });
 
   const sim = stateRes.data;
+  if (sim.is_paused) return NextResponse.json({ state: sim, agents: agentsRes.data, skipped: true });
+
   const agents = (agentsRes.data ?? []) as AgentRow[];
-
-  // Respect pause — return current state without advancing.
-  if (sim.is_paused) {
-    return NextResponse.json({ state: sim, agents, skipped: true });
-  }
-
   const newTick = sim.current_tick + 1;
   const newDay = sim.current_day + (newTick % TICKS_PER_DAY === 0 ? 1 : 0);
   const newTimeOfDay = timeOfDayForTick(newTick);
 
-  // --- Plan & resolve moves ---
-  // Occupancy map of tiles claimed by other agents THIS tick.
-  // Agents inside a building don't occupy a tile.
-  const occupancy = new Map<string, string>(); // "x,y" -> agentId
+  // ── Occupancy map ────────────────────────────────────────────────────────
+  const occupancy = new Map<string, string>(); // "x,y" → agentId
   for (const a of agents) {
-    if (a.current_building) continue;
-    occupancy.set(`${a.current_x},${a.current_y}`, a.id);
+    if (!a.current_building) occupancy.set(`${a.current_x},${a.current_y}`, a.id);
   }
   const keyOf = (x: number, y: number) => `${x},${y}`;
 
+  // ── Classify agents ──────────────────────────────────────────────────────
+  // Agents that need a full decision cycle (no path, not currently busy/inside)
+  const needsDecision = agents.filter((a) => {
+    if (newTick < a.next_decision_tick) return false; // still busy
+    if (a.current_building) return false; // exiting is handled separately
+    if (a.path && a.path.length > 0) return false; // still walking
+    return true;
+  });
+
+  // Agents inside a building whose wait is over → they just exit
+  const exiting = agents.filter(
+    (a) => a.current_building && newTick >= a.next_decision_tick,
+  );
+
+  // Agents actively walking → advance one step
+  const walking = agents.filter(
+    (a) =>
+      !a.current_building &&
+      a.path &&
+      a.path.length > 0 &&
+      newTick >= a.next_decision_tick,
+  );
+
+  // ── Night override ───────────────────────────────────────────────────────
+  // At night, agents not already home skip LLM and just go home.
+  const nightGoHome = newTimeOfDay === "night"
+    ? needsDecision.filter((a) => a.current_building !== a.home_building_id)
+    : [];
+  const aiDeciders = newTimeOfDay === "night"
+    ? needsDecision.filter((a) => a.current_building === a.home_building_id)
+    : needsDecision;
+
+  // ── Phase 1: Build observations ──────────────────────────────────────────
+  const observations: Map<string, string> = new Map();
+  for (const agent of aiDeciders) {
+    observations.set(
+      agent.id,
+      buildObservation(agent, agents, tilemap, newTick, newTimeOfDay, newDay),
+    );
+  }
+
+  // ── Phase 2: Embed observations (parallel) ───────────────────────────────
+  const embeddingResults = await Promise.allSettled(
+    aiDeciders.map((a) => embed(observations.get(a.id)!)),
+  );
+
+  // ── Phase 3: Retrieve memories + batch importance (parallel) ─────────────
+  const [memoryResults] = await Promise.all([
+    Promise.allSettled(
+      aiDeciders.map((a, i) => {
+        const embResult = embeddingResults[i];
+        if (embResult.status !== "fulfilled") return Promise.resolve([] as MemoryRow[]);
+        return retrieveMemories(a.id, embResult.value, newTick, supabase);
+      }),
+    ),
+  ]);
+
+  // ── Phase 4: Action decisions (parallel, allSettled) ─────────────────────
+  const decisionResults = await Promise.allSettled(
+    aiDeciders.map((a, i) =>
+      decideAction(
+        a,
+        observations.get(a.id)!,
+        memoryResults[i].status === "fulfilled" ? memoryResults[i].value : [],
+        newTimeOfDay,
+        newDay,
+      ),
+    ),
+  );
+
+  // ── Phase 5: Internal thoughts for idle agents ────────────────────────────
+  const idleAgents = aiDeciders.filter((a, i) => {
+    const dr = decisionResults[i];
+    return dr.status === "fulfilled" && dr.value.chosen_action === "idle";
+  });
+  const thoughtResults = await Promise.allSettled(
+    idleAgents.map((a) =>
+      Math.random() < INTERNAL_THOUGHT_CHANCE
+        ? generateThought(a, observations.get(a.id)!)
+        : Promise.resolve(null),
+    ),
+  );
+
+  // ── Phase 6: Importance scoring ───────────────────────────────────────────
+  const allObservationContents = aiDeciders.map((a) => observations.get(a.id)!);
+  const importanceScores = await scoreImportance(allObservationContents);
+
+  // ── Collect new memories to store ────────────────────────────────────────
+  type NewMemory = {
+    agent_id: string;
+    sim_tick: number;
+    type: string;
+    content: string;
+    embedding: number[] | null;
+    importance: number;
+    last_accessed: string;
+    access_count: number;
+  };
+  const newMemories: NewMemory[] = [];
+  const now = new Date().toISOString();
+
+  for (let i = 0; i < aiDeciders.length; i++) {
+    const agent = aiDeciders[i];
+    const content = observations.get(agent.id)!;
+    const embedding = embeddingResults[i].status === "fulfilled"
+      ? embeddingResults[i].value
+      : null;
+    newMemories.push({
+      agent_id: agent.id,
+      sim_tick: newTick,
+      type: "observation",
+      content,
+      embedding,
+      importance: importanceScores[i] ?? 0.3,
+      last_accessed: now,
+      access_count: 0,
+    });
+  }
+
+  // Thoughts
+  for (let i = 0; i < idleAgents.length; i++) {
+    const tr = thoughtResults[i];
+    if (tr.status === "fulfilled" && tr.value) {
+      // Thoughts are stored without embedding for now (low priority)
+      newMemories.push({
+        agent_id: idleAgents[i].id,
+        sim_tick: newTick,
+        type: "internal_thought",
+        content: tr.value,
+        embedding: null,
+        importance: 0.3,
+        last_accessed: now,
+        access_count: 0,
+      });
+    }
+  }
+
+  // ── Build agent updates ───────────────────────────────────────────────────
+  type AgentUpdate = {
+    id: string;
+    current_x?: number;
+    current_y?: number;
+    current_building?: string | null;
+    path?: { x: number; y: number }[] | null;
+    next_decision_tick?: number;
+    status?: string;
+  };
   const updates: AgentUpdate[] = [];
 
-  for (const agent of agents) {
-    // Skip if still "busy" (e.g. sitting inside a building)
-    if (newTick < agent.next_decision_tick) continue;
+  // 1. Exiting agents
+  for (const agent of exiting) {
+    updates.push({
+      id: agent.id,
+      current_building: null,
+      path: null,
+      next_decision_tick: newTick + 1 + rand(3),
+      status: "idle",
+    });
+  }
 
-    // If inside a building and the wait is over → exit at that building's entry tile.
-    if (agent.current_building) {
-      updates.push({
-        id: agent.id,
-        current_building: null,
-        path: null,
-        next_decision_tick: newTick + 1 + rand(3),
-        status: "idle",
-      });
-      continue;
-    }
+  // 2. Walking agents — advance one step
+  for (const agent of walking) {
+    const nextStep = agent.path![0];
+    const nextKey = keyOf(nextStep.x, nextStep.y);
+    const holder = occupancy.get(nextKey);
+    if (holder && holder !== agent.id) continue; // blocked — wait
 
-    // If agent has a path → try to advance one step.
-    if (agent.path && agent.path.length > 0) {
-      const nextStep = agent.path[0];
-      const nextKey = keyOf(nextStep.x, nextStep.y);
+    occupancy.delete(keyOf(agent.current_x, agent.current_y));
+    occupancy.set(nextKey, agent.id);
+    const remaining = agent.path!.slice(1);
 
-      // If another agent already holds that tile this tick, wait.
-      const holder = occupancy.get(nextKey);
-      if (holder && holder !== agent.id) {
-        // Wait; try again next tick.
-        continue;
-      }
-
-      // Move.
-      occupancy.delete(keyOf(agent.current_x, agent.current_y));
-      occupancy.set(nextKey, agent.id);
-      const remaining = agent.path.slice(1);
-
-      // Arrived? Check if we ended on a building entry and maybe enter.
-      if (remaining.length === 0) {
-        const entry = tilemap.buildingEntries.find(
-          (b) => b.entryX === nextStep.x && b.entryY === nextStep.y &&
-                 ENTERABLE_BUILDING_IDS.has(b.id),
-        );
-        if (entry && Math.random() < 0.5) {
-          occupancy.delete(nextKey); // agent is indoors, frees the tile
-          updates.push({
-            id: agent.id,
-            current_x: nextStep.x,
-            current_y: nextStep.y,
-            current_building: BUILDING_ID_TO_KEY[entry.id] ?? String(entry.id),
-            path: null,
-            next_decision_tick: newTick + 4 + rand(8), // stay 4–12 ticks
-            status: "resting",
-          });
-          continue;
-        }
-        // Plain arrival — no building entered.
+    if (remaining.length === 0) {
+      // Arrived at destination
+      const entry = tilemap.buildingEntries.find(
+        (b) => b.entryX === nextStep.x && b.entryY === nextStep.y && ENTERABLE_BUILDING_IDS.has(b.id),
+      );
+      if (entry && Math.random() < 0.5) {
+        occupancy.delete(nextKey);
         updates.push({
           id: agent.id,
           current_x: nextStep.x,
           current_y: nextStep.y,
+          current_building: BUILDING_ID_TO_KEY[entry.id] ?? String(entry.id),
           path: null,
-          next_decision_tick: newTick + 1 + rand(3),
-          status: "idle",
+          next_decision_tick: newTick + 4 + rand(8),
+          status: "resting",
         });
         continue;
       }
-
+      updates.push({
+        id: agent.id,
+        current_x: nextStep.x,
+        current_y: nextStep.y,
+        path: null,
+        next_decision_tick: newTick + 1 + rand(2),
+        status: "idle",
+      });
+    } else {
       updates.push({
         id: agent.id,
         current_x: nextStep.x,
@@ -155,53 +471,117 @@ export async function POST() {
         path: remaining,
         status: "walking",
       });
+    }
+  }
+
+  // 3. Night go-home overrides (no LLM)
+  for (const agent of nightGoHome) {
+    const homeEntry = buildingEntry(agent.home_building_id, tilemap);
+    if (!homeEntry) continue;
+    const path = findPath(
+      { x: agent.current_x, y: agent.current_y },
+      { x: homeEntry.entryX, y: homeEntry.entryY },
+      tilemap.width, tilemap.height,
+      (x, y) => tilemap.collision[y][x] === 1,
+    );
+    if (path) {
+      updates.push({ id: agent.id, path, status: "walking" });
+    }
+  }
+
+  // 4. AI-decided actions
+  for (let i = 0; i < aiDeciders.length; i++) {
+    const agent = aiDeciders[i];
+    const dr = decisionResults[i];
+
+    // Fallback: random wander if LLM failed
+    if (dr.status === "rejected") {
+      let planned: { x: number; y: number }[] | null = null;
+      for (let attempt = 0; attempt < 6 && !planned; attempt++) {
+        const tx = 1 + rand(tilemap.width - 2);
+        const ty = 1 + rand(tilemap.height - 2);
+        if (tilemap.collision[ty][tx] === 1) continue;
+        planned = findPath(
+          { x: agent.current_x, y: agent.current_y },
+          { x: tx, y: ty },
+          tilemap.width, tilemap.height,
+          (x, y) => tilemap.collision[y][x] === 1,
+        );
+      }
+      if (planned) updates.push({ id: agent.id, path: planned, status: "walking" });
       continue;
     }
 
-    // No path — pick a random walkable destination and plan a route.
-    // Avoid destinations that are tiles currently held by another agent, or
-    // the agent's own tile. Try a few candidates before giving up.
-    let planned: { x: number; y: number }[] | null = null;
-    for (let attempt = 0; attempt < 8 && !planned; attempt++) {
-      const tx = 1 + rand(tilemap.width - 2);
-      const ty = 1 + rand(tilemap.height - 2);
-      if (tx === agent.current_x && ty === agent.current_y) continue;
-      if (tilemap.collision[ty][tx] === 1) continue;
-      const holder = occupancy.get(keyOf(tx, ty));
-      if (holder && holder !== agent.id) continue;
-      // Path must avoid static collision AND tiles held by other agents RIGHT
-      // NOW — but we allow the goal tile itself (checked inside findPath).
-      planned = findPath(
-        { x: agent.current_x, y: agent.current_y },
-        { x: tx, y: ty },
-        tilemap.width,
-        tilemap.height,
-        (x, y) => {
-          if (tilemap.collision[y][x] === 1) return true;
-          const h = occupancy.get(keyOf(x, y));
-          return !!(h && h !== agent.id);
-        },
-      );
+    const decision = dr.value;
+
+    if (decision.chosen_action === "idle") {
+      updates.push({
+        id: agent.id,
+        path: null,
+        next_decision_tick: newTick + 3 + rand(4),
+        status: "thinking",
+      });
+      continue;
     }
 
-    if (!planned) continue; // try again next tick
+    if (decision.chosen_action === "go_home") {
+      const homeEntry = buildingEntry(agent.home_building_id, tilemap);
+      if (homeEntry) {
+        const path = findPath(
+          { x: agent.current_x, y: agent.current_y },
+          { x: homeEntry.entryX, y: homeEntry.entryY },
+          tilemap.width, tilemap.height,
+          (x, y) => tilemap.collision[y][x] === 1,
+        );
+        if (path) updates.push({ id: agent.id, path, status: "walking" });
+      }
+      continue;
+    }
 
-    updates.push({
-      id: agent.id,
-      path: planned,
-      status: "walking",
-    });
+    // move_to
+    if (decision.chosen_action === "move_to") {
+      const target = buildingEntry(decision.target_building, tilemap);
+      if (target) {
+        const path = findPath(
+          { x: agent.current_x, y: agent.current_y },
+          { x: target.entryX, y: target.entryY },
+          tilemap.width, tilemap.height,
+          (x, y) => tilemap.collision[y][x] === 1,
+        );
+        if (path) {
+          updates.push({ id: agent.id, path, status: "walking" });
+          continue;
+        }
+      }
+      // No valid building target or path failed — random wander fallback
+      let planned: { x: number; y: number }[] | null = null;
+      for (let attempt = 0; attempt < 6 && !planned; attempt++) {
+        const tx = 1 + rand(tilemap.width - 2);
+        const ty = 1 + rand(tilemap.height - 2);
+        if (tilemap.collision[ty][tx] === 1) continue;
+        planned = findPath(
+          { x: agent.current_x, y: agent.current_y },
+          { x: tx, y: ty },
+          tilemap.width, tilemap.height,
+          (x, y) => tilemap.collision[y][x] === 1,
+        );
+      }
+      if (planned) updates.push({ id: agent.id, path: planned, status: "walking" });
+    }
   }
 
-  // --- Persist updates ---
-  // Supabase JS doesn't do true batch updates across different PKs, but our
-  // agent count is small (~12). Fire them off in parallel.
+  // ── Persist memories ─────────────────────────────────────────────────────
+  if (newMemories.length > 0) {
+    const { error: memErr } = await supabase.from("memories").insert(newMemories);
+    if (memErr) console.error("Memory insert error:", memErr.message);
+  }
+
+  // ── Persist agent updates ────────────────────────────────────────────────
   if (updates.length > 0) {
     const results = await Promise.all(
-      updates.map((u) => {
-        const { id, ...rest } = u;
-        return supabase.from("agents").update(rest).eq("id", id);
-      }),
+      updates.map(({ id, ...rest }) =>
+        supabase.from("agents").update(rest).eq("id", id),
+      ),
     );
     const firstErr = results.find((r) => r.error)?.error;
     if (firstErr) {
@@ -212,31 +592,22 @@ export async function POST() {
     }
   }
 
+  // ── Update simulation_state ───────────────────────────────────────────────
   const { error: stateErr } = await supabase
     .from("simulation_state")
-    .update({
-      current_tick: newTick,
-      current_day: newDay,
-      time_of_day: newTimeOfDay,
-    })
+    .update({ current_tick: newTick, current_day: newDay, time_of_day: newTimeOfDay })
     .eq("id", sim.id);
-  if (stateErr) {
-    return NextResponse.json({ error: stateErr.message }, { status: 500 });
-  }
+  if (stateErr) return NextResponse.json({ error: stateErr.message }, { status: 500 });
 
-  // Return the fresh state by re-reading (positions we just updated).
+  // ── Return fresh agent list ───────────────────────────────────────────────
   const { data: freshAgents } = await supabase
     .from("agents")
-    .select("id, name, sprite_key, current_x, current_y, current_building, status, is_sleeping, path")
+    .select("id, name, sprite_key, current_x, current_y, current_building, status, is_sleeping")
     .order("name", { ascending: true });
 
   return NextResponse.json({
-    state: {
-      ...sim,
-      current_tick: newTick,
-      current_day: newDay,
-      time_of_day: newTimeOfDay,
-    },
+    state: { ...sim, current_tick: newTick, current_day: newDay, time_of_day: newTimeOfDay },
     agents: freshAgents ?? [],
+    memoriesAdded: newMemories.length,
   });
 }

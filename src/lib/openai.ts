@@ -76,9 +76,14 @@ export async function embed(text: string): Promise<number[]> {
 // -----------------------------------------------------------
 
 export const ActionDecisionSchema = z.object({
-  chosen_action: z.string(),
-  target: z.string(),
-  reasoning: z.string(),
+  // One of: "move_to" | "idle" | "go_home"
+  // talk_to added in Chunk 5.
+  chosen_action: z.enum(["move_to", "idle", "go_home"]),
+  // For move_to: the building key to head toward ("inn", "library", "bakery",
+  // "workshop", "apothecary", "park", "plaza", "cottage_1"…"cottage_5"),
+  // or null to wander freely.  Ignored for idle / go_home.
+  target_building: z.string().nullable(),
+  reasoning: z.string().max(300),
 });
 
 export const ConversationTurnSchema = z.object({
@@ -93,6 +98,11 @@ export const ReflectionSchema = z.object({
 
 export const ImportanceScoresSchema = z.object({
   scores: z.array(z.number()),
+});
+
+// Schema for a single internal thought (Chunk 4)
+export const InternalThoughtSchema = z.object({
+  thought: z.string().max(200),
 });
 
 // Schema for the Chunk-2 backstory generation call
