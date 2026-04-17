@@ -77,6 +77,26 @@ type BubbleBound = {
   x: number; y: number; w: number; h: number; // canvas px coords
 };
 
+type AgentBound = {
+  agentId: string;
+  x: number; y: number; w: number; h: number;
+};
+
+type MemoryEntry = { type: string; content: string; sim_tick: number; importance: number };
+type GoalEntry = { id: string; description: string; priority: number; status: string; steps: unknown; created_at_tick: number };
+type RelEntry = { target_id: string; targetName: string; familiarity: number; sentiment: number; summary: string | null; interaction_count: number };
+
+type InspectorData = {
+  agent: {
+    id: string; name: string; backstory: string; traits: string[];
+    sprite_key: string; status: string; current_building: string | null;
+    home_building_id: string; current_x: number; current_y: number;
+  };
+  memories: MemoryEntry[];
+  goals: GoalEntry[];
+  relationships: RelEntry[];
+};
+
 // Client-side rendering state for each agent — includes visual interpolation.
 type AgentRender = AgentServer & {
   prevX: number;
@@ -110,7 +130,9 @@ export default function GameCanvas() {
   const simStateRef = useRef<SimState | null>(null);
   const speechBubblesRef = useRef<SpeechBubble[]>([]);
   const bubbleBoundsRef = useRef<BubbleBound[]>([]);
+  const agentBoundsRef = useRef<AgentBound[]>([]);
   const convoLogRef = useRef<ConvoLog[]>([]);
+  const inspectorIdRef = useRef<string | null>(null);
 
   const [convoLog, setConvoLog] = useState<ConvoLog[]>([]);
   const [logOpen, setLogOpen] = useState(false);
@@ -122,10 +144,16 @@ export default function GameCanvas() {
   const [initing, setIniting] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
   const [restarting, setRestarting] = useState(false);
+  const [inspectorId, setInspectorId] = useState<string | null>(null);
+  const [inspectorData, setInspectorData] = useState<InspectorData | null>(null);
+  const [inspectorLoading, setInspectorLoading] = useState(false);
 
   const [simState, setSimState] = useState<SimState | null>(null);
   const [speed, setSpeed] = useState<number>(1);
   const [paused, setPaused] = useState(true);
+
+  // Keep inspectorIdRef in sync so the render loop can draw a selection ring
+  inspectorIdRef.current = inspectorId;
 
   // Zoom: responsiveScale fits canvas to window; userZoom is user-controlled multiplier
   const [responsiveScale, setResponsiveScale] = useState(1);
@@ -545,6 +573,38 @@ export default function GameCanvas() {
         ctx.fillText(agent.name, lx, ly);
       }
 
+      // Record agent click bounds + draw selection ring for inspector
+      agentBoundsRef.current = [];
+      for (const agent of agentsRef.current) {
+        if (agent.current_building) continue;
+        const t = Math.min(1, (timestamp - agent.tickArrivedAt) / agent.lerpDurationMs);
+        const vx = agent.prevX + (agent.current_x - agent.prevX) * t;
+        const vy = agent.prevY + (agent.current_y - agent.prevY) * t;
+        agentBoundsRef.current.push({
+          agentId: agent.id,
+          x: vx * TILE_SIZE + 2,
+          y: vy * TILE_SIZE + 2,
+          w: TILE_SIZE - 4,
+          h: TILE_SIZE - 2,
+        });
+        if (agent.id === inspectorIdRef.current) {
+          ctx.save();
+          ctx.strokeStyle = "#ffd700";
+          ctx.lineWidth = 2;
+          ctx.shadowColor = "#ffd700";
+          ctx.shadowBlur = 6;
+          ctx.beginPath();
+          ctx.arc(
+            vx * TILE_SIZE + TILE_SIZE / 2,
+            vy * TILE_SIZE + TILE_SIZE / 2,
+            TILE_SIZE * 0.72,
+            0, Math.PI * 2,
+          );
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+
       // Speech bubbles — expire old, draw active, record click bounds
       speechBubblesRef.current = speechBubblesRef.current.filter((b) => b.expiresAt > timestamp);
       const agentMap = new Map(agentsRef.current.map((a) => [a.id, a]));
@@ -675,6 +735,18 @@ export default function GameCanvas() {
     }
   }, [selectedConvoIdx, logOpen]);
 
+  // Fetch agent detail when inspector opens
+  useEffect(() => {
+    if (!inspectorId) { setInspectorData(null); return; }
+    setInspectorLoading(true);
+    setInspectorData(null);
+    fetch(`/api/agent/${inspectorId}`)
+      .then((r) => r.json())
+      .then((d) => setInspectorData(d))
+      .catch(() => {})
+      .finally(() => setInspectorLoading(false));
+  }, [inspectorId]);
+
   // Canvas click: check if any speech bubble was clicked
   const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const rect = canvasRef.current?.getBoundingClientRect();
@@ -683,6 +755,15 @@ export default function GameCanvas() {
     const canvasX = ((e.clientX - rect.left) / rect.width) * CANVAS_PIXEL_W;
     const canvasY = ((e.clientY - rect.top) / rect.height) * CANVAS_PIXEL_H;
 
+    // Agent sprites take priority over speech bubbles
+    for (const b of agentBoundsRef.current) {
+      if (canvasX >= b.x && canvasX <= b.x + b.w && canvasY >= b.y && canvasY <= b.y + b.h) {
+        setInspectorId((prev) => (prev === b.agentId ? null : b.agentId)); // toggle
+        return;
+      }
+    }
+
+    // Speech bubble click → open conversation log entry
     for (const b of bubbleBoundsRef.current) {
       if (canvasX >= b.x && canvasX <= b.x + b.w && canvasY >= b.y && canvasY <= b.y + b.h) {
         const idx = convoLogRef.current.findIndex(
@@ -832,7 +913,7 @@ export default function GameCanvas() {
       </div>
 
       <p className="text-xs text-gray-500 mt-2 font-mono">
-        Chunk 5 — Conversations & Relationships · Click speech bubbles to view dialogue
+        Chunk 6 — Reflections & Goals · Click an agent to inspect · Click speech bubbles to view dialogue
       </p>
 
       {/* Conversation log panel */}
@@ -873,6 +954,154 @@ export default function GameCanvas() {
           </div>
         )}
       </div>
+      {/* Agent inspector overlay */}
+      {inspectorId && (
+        <div
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-black/60"
+          onClick={() => setInspectorId(null)}
+        >
+          <div
+            className="bg-gray-900 border border-gray-700 rounded-t-xl sm:rounded-xl w-full sm:max-w-sm max-h-[80vh] overflow-y-auto font-mono text-xs"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {inspectorLoading || !inspectorData ? (
+              <div className="p-6 text-gray-500 text-center">
+                {inspectorLoading ? "Loading…" : "No data"}
+              </div>
+            ) : (
+              <>
+                {/* Header */}
+                <div className="flex items-center gap-3 p-4 border-b border-gray-800 sticky top-0 bg-gray-900">
+                  <div
+                    className="w-9 h-9 rounded-full flex-shrink-0 border-2 border-gray-600"
+                    style={{ background: inspectorData.agent.sprite_key.replace("char:", "") }}
+                  />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-amber-200 font-bold text-sm truncate">
+                      {inspectorData.agent.name}
+                    </div>
+                    <div className="flex gap-1 flex-wrap mt-0.5">
+                      {inspectorData.agent.traits.map((t, i) => (
+                        <span key={i} className="px-1.5 py-0.5 bg-gray-800 rounded text-gray-400 text-xs">
+                          {t}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setInspectorId(null)}
+                    className="text-gray-500 hover:text-white text-lg leading-none flex-shrink-0"
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                <div className="p-4 space-y-4">
+                  {/* Status */}
+                  <div className="flex items-center gap-2 text-gray-400">
+                    <span className={`px-2 py-0.5 rounded text-xs font-bold ${
+                      inspectorData.agent.status === "walking" ? "bg-blue-900 text-blue-300" :
+                      inspectorData.agent.status === "talking" ? "bg-green-900 text-green-300" :
+                      inspectorData.agent.status === "resting" ? "bg-purple-900 text-purple-300" :
+                      inspectorData.agent.status === "thinking" ? "bg-yellow-900 text-yellow-300" :
+                      "bg-gray-800 text-gray-400"
+                    }`}>
+                      {inspectorData.agent.status}
+                    </span>
+                    <span className="text-gray-500 text-xs">
+                      {inspectorData.agent.current_building
+                        ? `inside ${inspectorData.agent.current_building}`
+                        : `tile (${inspectorData.agent.current_x}, ${inspectorData.agent.current_y})`}
+                    </span>
+                  </div>
+
+                  {/* Backstory */}
+                  <details className="group">
+                    <summary className="text-gray-400 cursor-pointer list-none flex items-center gap-1 select-none">
+                      <span className="group-open:rotate-90 transition-transform inline-block">▶</span>
+                      Backstory
+                    </summary>
+                    <p className="text-gray-400 mt-2 leading-relaxed text-xs">
+                      {inspectorData.agent.backstory}
+                    </p>
+                  </details>
+
+                  {/* Recent Memories */}
+                  <div>
+                    <div className="text-gray-300 font-bold mb-2">Recent Memories</div>
+                    {inspectorData.memories.length === 0 ? (
+                      <div className="text-gray-600 italic">None yet</div>
+                    ) : (
+                      inspectorData.memories.slice(0, 6).map((m, i) => (
+                        <div key={i} className="mb-2 text-xs leading-relaxed">
+                          <span className={`font-bold mr-1 ${
+                            m.type === "reflection" ? "text-purple-400" :
+                            m.type === "conversation" ? "text-sky-400" :
+                            m.type === "internal_thought" ? "text-yellow-400" :
+                            "text-green-400"
+                          }`}>
+                            [{m.type}]
+                          </span>
+                          <span className="text-gray-400">{m.content}</span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  {/* Active Goals */}
+                  {inspectorData.goals.length > 0 && (
+                    <div>
+                      <div className="text-gray-300 font-bold mb-2">Active Goals</div>
+                      {inspectorData.goals.map((g, i) => (
+                        <div key={i} className="bg-gray-800 rounded-lg p-3 mb-2">
+                          <div className="text-amber-300 leading-snug">{g.description}</div>
+                          <div className="text-gray-500 mt-1">Priority {g.priority}/5</div>
+                          {Array.isArray(g.steps) && (g.steps as string[]).length > 0 && (
+                            <ul className="text-gray-500 mt-1 space-y-0.5 list-none">
+                              {(g.steps as string[]).map((s, j) => (
+                                <li key={j} className="flex gap-1">
+                                  <span className="text-gray-600">›</span>
+                                  {s}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Relationships */}
+                  {inspectorData.relationships.length > 0 && (
+                    <div>
+                      <div className="text-gray-300 font-bold mb-2">Relationships</div>
+                      {inspectorData.relationships.map((r, i) => (
+                        <div key={i} className="flex items-center gap-2 mb-2">
+                          <span className="text-gray-300 w-28 truncate flex-shrink-0">
+                            {r.targetName}
+                          </span>
+                          <div className="flex-1 h-1.5 bg-gray-800 rounded-full overflow-hidden">
+                            <div
+                              className="h-full rounded-full"
+                              style={{
+                                width: `${Math.round(r.familiarity * 100)}%`,
+                                background: r.sentiment >= 0 ? "#d97706" : "#7f1d1d",
+                              }}
+                            />
+                          </div>
+                          <span className="text-gray-500 text-xs w-8 text-right flex-shrink-0">
+                            {Math.round(r.familiarity * 100)}%
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

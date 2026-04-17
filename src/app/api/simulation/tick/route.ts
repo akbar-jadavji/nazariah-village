@@ -7,6 +7,7 @@ import {
   callJSON, embed,
   MODEL_HIGH, MODEL_LOW,
   ActionDecisionSchema, ImportanceScoresSchema, InternalThoughtSchema,
+  ReflectionSchema, GoalSchema,
 } from "@/lib/openai";
 import { runConversation, RelationshipSnap } from "@/engine/conversation";
 import { TileMap } from "@/lib/types";
@@ -778,6 +779,95 @@ export async function POST() {
         { status: 500 },
       );
     }
+  }
+
+  // ── Periodic reflections + goal formation ────────────────────────────
+  // Every 20 ticks, up to 2 agents synthesise recent memories into a
+  // reflection and optionally form a new goal.
+  const REFLECTION_EVERY = 20;
+  if (newTick % REFLECTION_EVERY === 0 && agents.length > 0) {
+    const candidates = agents
+      .filter((a) => !a.current_building)
+      .sort(() => Math.random() - 0.5)
+      .slice(0, 2);
+
+    await Promise.allSettled(
+      candidates.map(async (agent) => {
+        try {
+          const { data: mems } = await supabase
+            .from("memories")
+            .select("type, content, sim_tick")
+            .eq("agent_id", agent.id)
+            .order("sim_tick", { ascending: false })
+            .limit(12);
+
+          if (!mems || mems.length < 4) return;
+
+          const memText = mems
+            .map((m) => `[${m.type}] ${m.content}`)
+            .join("\n");
+
+          const reflection = await callJSON({
+            model: MODEL_LOW,
+            system: `You are ${agent.name}. Traits: ${agent.traits.join(", ")}.
+Write 1-2 reflective insights based on your recent experiences.
+Respond with JSON: { "reflections": ["insight 1", "insight 2"] }`,
+            user: `Recent experiences:\n${memText}`,
+            schema: ReflectionSchema,
+            temperature: 0.85,
+            maxTokens: 200,
+          });
+
+          const reflectionText = reflection.reflections.join(" ");
+
+          await supabase.from("memories").insert({
+            agent_id: agent.id,
+            sim_tick: newTick,
+            type: "reflection",
+            content: reflectionText,
+            embedding: null,
+            importance: 0.7,
+            last_accessed: new Date().toISOString(),
+            access_count: 0,
+          });
+
+          // 35% chance to form a new goal if none currently active
+          if (Math.random() < 0.35) {
+            const { data: active } = await supabase
+              .from("goals")
+              .select("id")
+              .eq("agent_id", agent.id)
+              .eq("status", "active")
+              .limit(1);
+
+            if (!active || active.length === 0) {
+              const goal = await callJSON({
+                model: MODEL_LOW,
+                system: `You are ${agent.name}. Traits: ${agent.traits.join(", ")}.
+Based on your reflection, define one concrete personal goal you want to work toward.
+Respond with JSON: { "description": "...", "priority": 1-5, "steps": ["step1", "step2"] }`,
+                user: `Reflection: ${reflectionText}`,
+                schema: GoalSchema,
+                temperature: 0.8,
+                maxTokens: 150,
+              });
+
+              await supabase.from("goals").insert({
+                agent_id: agent.id,
+                description: goal.description,
+                priority: goal.priority,
+                status: "active",
+                steps: goal.steps,
+                created_at_tick: newTick,
+                completed_at_tick: null,
+              });
+            }
+          }
+        } catch {
+          // Reflection failures are non-fatal
+        }
+      }),
+    );
   }
 
   // ── Update simulation_state ───────────────────────────────────────────────

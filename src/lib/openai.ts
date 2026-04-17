@@ -123,3 +123,10 @@ export const ConversationSentimentSchema = z.object({
 export const BackstorySchema = z.object({
   backstory: z.string().min(50),
 });
+
+// Schema for Chunk-6 goal formation
+export const GoalSchema = z.object({
+  description: z.string().max(200),
+  priority: z.number().min(1).max(5).int(),
+  steps: z.array(z.string()).max(5),
+});
