@@ -15,7 +15,7 @@ export function serverClient() {
   });
 }
 
-// DB row types — kept in sync with supabase/migrations/001_initial_schema.sql
+// DB row types — kept in sync with supabase/migrations/*
 export type AgentRow = {
   id: string;
   name: string;
@@ -28,6 +28,8 @@ export type AgentRow = {
   current_building: string | null;
   status: string;
   is_sleeping: boolean;
+  path: { x: number; y: number }[] | null;
+  next_decision_tick: number;
   created_at: string;
 };
 

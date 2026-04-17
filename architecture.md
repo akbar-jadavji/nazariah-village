@@ -153,3 +153,65 @@ Returns the public-safe subset of agent fields (no backstory) plus current sim s
 2. Run `supabase/migrations/001_initial_schema.sql` in Supabase SQL Editor.
 3. Get an `OPENAI_API_KEY` from platform.openai.com.
 4. Reload the app → click **Initialize World**.
+
+---
+
+## Chunk 3: Agent Movement & Pathfinding
+
+### New files
+
+```
+src/
+├── app/api/simulation/
+│   ├── tick/route.ts         # POST — advance all agents one step, returns updated world
+│   └── pause/route.ts        # POST — toggle is_paused in simulation_state
+├── engine/
+│   ├── pathfinding.ts        # A* on 4-connected tile grid (closure-based blocked fn)
+│   └── buildings.ts          # Numeric bldg ID ↔ string key mapping, enterable set
+supabase/migrations/
+└── 002_agent_movement.sql    # Adds path (JSONB), next_decision_tick (INTEGER) to agents
+```
+
+### A* pathfinding (`engine/pathfinding.ts`)
+
+`findPath(start, goal, width, height, blocked)` returns the list of tile steps from start (exclusive) to goal (inclusive), or `null` if unreachable.
+
+- 4-connected grid (no diagonal movement)
+- `blocked(x, y)` closure lets callers mix static collision with dynamic occupancy
+- Max 2000 nodes expanded before giving up (prevents infinite loops on pathological maps)
+- Returns `[]` if start === goal
+
+### /api/simulation/tick — tick loop
+
+Chunk 3 is pure movement, no LLM calls.
+
+**Per-tick pipeline (server-side):**
+
+1. Fetch `simulation_state` + all agents from Supabase.
+2. If `is_paused`, return current state unchanged.
+3. Increment `current_tick`. Advance `time_of_day` / `current_day` (96 ticks/day: morning < 20, midday < 48, afternoon < 64, evening < 80, night ≤ 96).
+4. Build occupancy map `"x,y" → agentId` for all visible (non-indoor) agents.
+5. For each agent:
+   - **Skip** if `current_tick < next_decision_tick` (busy: inside a building, brief idle).
+   - **Exit building**: if `current_building != null` and wait is over → clear `current_building`, `next_decision_tick = tick + 1–3`.
+   - **Walk**: if `path` has tiles → attempt to advance to `path[0]`. If another agent holds that tile, wait. On arrival at path end, 50% chance to enter an enterable building (set `current_building`, `next_decision_tick = tick + 4–12`).
+   - **Plan**: if no path → pick up to 8 random walkable destinations, run A* avoiding static collision + current occupancy. Store path.
+6. Batch-update changed agents in parallel (`Promise.all`).
+7. Update `simulation_state` tick/day/time. Return fresh agent list.
+
+**Collision avoidance**: occupancy map prevents two agents landing on the same tile in the same tick. First-processed agent wins; others wait.
+
+**Building enter/exit**: entry tiles are walkable in the static grid. When an agent steps onto an entry tile that belongs to an enterable building (not plaza/park), there's a 50% chance they "enter" — sprite disappears, `current_building` is set, `next_decision_tick` holds them for 4–12 ticks. On exit, they reappear at the same entry tile.
+
+### /api/simulation/pause
+
+`POST { paused: boolean }` — toggles `simulation_state.is_paused`. Frontend applies optimistically.
+
+### Canvas updates
+
+- **Play/Pause button** in the header. Paused by default (user must press Play).
+- **Speed selector** (1x / 2x / 5x / 10x) → `1000 / 500 / 200 / 100 ms` between ticks.
+- **Tick counter + day + time-of-day** shown in header bar.
+- **Tick polling**: `setInterval` fires `POST /api/simulation/tick` at the selected speed while unpaused and agents exist. First tick fires immediately on play.
+- **Agent interpolation**: each agent has `prevX/prevY` (position when tick arrived) and `current_x/current_y` (new target). Visual position is linearly interpolated over one tick interval: `t = (now - tickArrivedAt) / tickIntervalMs`, clamped to [0, 1]. Movement direction derived from the delta.
+- Agents inside a building are hidden (sprite not drawn, name label not drawn).
