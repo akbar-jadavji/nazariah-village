@@ -279,3 +279,65 @@ At evening/night, warm radial gradients are drawn from each building (window glo
 1. Run `supabase/migrations/003_memory_retrieval.sql` in Supabase SQL Editor.
 2. Ensure `OPENAI_API_KEY` is in `.env.local`.
 3. Without OpenAI configured, agents degrade to Chunk 3 random wander (no crash).
+
+---
+
+## Chunk 5: Conversations & Relationships
+
+### New / changed files
+
+```
+src/
+├── engine/conversation.ts                      # Turn pipeline, sentiment, memory summaries
+├── app/api/agent/[id]/conversations/route.ts   # GET — last 20 conversations for an agent
+├── app/api/simulation/tick/route.ts            # + conversation detection & pipeline
+├── lib/openai.ts                               # + talk_to in ActionDecisionSchema,
+│                                               #   ConversationSentimentSchema
+├── components/Canvas/GameCanvas.tsx            # + speech bubbles, conversation log panel
+supabase/migrations/
+└── 004_conversations.sql                       # conversations table + indexes
+```
+
+### Conversation engine (`engine/conversation.ts`)
+
+`runConversation(agentA, agentB, relAtoB, relBtoA, memsA, memsB, location)` drives a 2–4 turn GPT-4-turbo dialogue and returns:
+
+- `turns[]` — `{ speaker, speakerId, line, thought }` per turn
+- `memoryA/B` — conversation summary string stored in each agent's memory stream
+- `sentimentDeltaA/B` — how each agent's feeling toward the other shifted (GPT-4o-mini rated, ±0.3 max per conversation)
+- `relationshipNote` — one-line summary for the relationship record
+- `importance[2]` — memory importance scores (GPT-4o-mini batched)
+
+Turn structure: A opens → B responds → A continues (if `end_conversation: false`) → B closes. LLM decides to end early via the `end_conversation` boolean in `ConversationTurnSchema`.
+
+### Tick pipeline additions (Chunk 5)
+
+After action decisions:
+
+1. Agents who chose `talk_to` with a reachable target (within 3 tiles, not inside a building) are paired.
+2. Each pair fetches their relationship record and last 3 conversation memories from Supabase.
+3. All conversation pairs run in parallel (`Promise.allSettled`).
+4. On success: conversation stored in `conversations` table, memory summaries inserted with embeddings TBD (Chunk 4 embeds them on next decision cycle), relationship upserted (`familiarity += 0.05`, `sentiment += delta`). Every 5 interactions, `relationship.summary` is updated with the latest `relationshipNote`.
+
+### Relationships table updates
+
+- `familiarity` grows by 0.05 per conversation (capped at 1.0).
+- `sentiment` shifts by GPT-4o-mini rated delta (−0.3 to +0.3 per conversation).
+- `interaction_count` increments each conversation.
+- `summary` regenerated every 5 interactions.
+
+### Frontend: speech bubbles
+
+After each tick, if conversations occurred, the last spoken line for each participant is pushed into `speechBubblesRef`. In the `requestAnimationFrame` loop:
+- Bubbles expire after 6 seconds.
+- Fade out in the last 1.5 seconds (`globalAlpha` ramp).
+- Rendered as rounded-rect text boxes with a tail pointing down to the agent, positioned above the name label.
+- Text is word-wrapped at ~28 characters per line.
+
+### Frontend: conversation log panel
+
+A collapsible panel below the canvas shows the last 20 conversations from the current session (stored in React state, not persisted on reload). Each entry shows tick number, agent names, and all dialogue turns color-coded by speaker.
+
+### Setup required (one-time for Chunk 5)
+
+Run `supabase/migrations/004_conversations.sql` in Supabase SQL Editor.

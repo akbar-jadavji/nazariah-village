@@ -76,13 +76,14 @@ export async function embed(text: string): Promise<number[]> {
 // -----------------------------------------------------------
 
 export const ActionDecisionSchema = z.object({
-  // One of: "move_to" | "idle" | "go_home"
-  // talk_to added in Chunk 5.
-  chosen_action: z.enum(["move_to", "idle", "go_home"]),
-  // For move_to: the building key to head toward ("inn", "library", "bakery",
-  // "workshop", "apothecary", "park", "plaza", "cottage_1"…"cottage_5"),
-  // or null to wander freely.  Ignored for idle / go_home.
-  target_building: z.string().nullable(),
+  // Supported: "move_to" | "idle" | "go_home" | "talk_to"
+  chosen_action: z.enum(["move_to", "idle", "go_home", "talk_to"]),
+  // For move_to: building key ("inn", "library", "bakery", "workshop",
+  // "apothecary", "park", "plaza", "cottage_1"…"cottage_5"), or null.
+  target_building: z.string().nullish().default(null),
+  // For talk_to: exact name of the nearby agent to approach and talk to.
+  // Null for all other actions.
+  target_agent: z.string().nullish().default(null),
   reasoning: z.string().max(300),
 });
 
@@ -103,6 +104,19 @@ export const ImportanceScoresSchema = z.object({
 // Schema for a single internal thought (Chunk 4)
 export const InternalThoughtSchema = z.object({
   thought: z.string().max(200),
+});
+
+// Schema for a single conversation turn (Chunk 5)
+// ConversationTurnSchema already exported above — re-used here.
+
+// Schema for post-conversation sentiment analysis (Chunk 5)
+export const ConversationSentimentSchema = z.object({
+  // How much A's sentiment toward B changed this conversation (-0.3 to +0.3)
+  sentiment_delta_a: z.number().min(-0.3).max(0.3),
+  // How much B's sentiment toward A changed this conversation (-0.3 to +0.3)
+  sentiment_delta_b: z.number().min(-0.3).max(0.3),
+  // One-line summary of the conversation for relationship records
+  relationship_note: z.string().max(200),
 });
 
 // Schema for the Chunk-2 backstory generation call

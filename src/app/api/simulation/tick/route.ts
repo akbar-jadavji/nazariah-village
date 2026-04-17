@@ -8,6 +8,7 @@ import {
   MODEL_HIGH, MODEL_LOW,
   ActionDecisionSchema, ImportanceScoresSchema, InternalThoughtSchema,
 } from "@/lib/openai";
+import { runConversation, RelationshipSnap } from "@/engine/conversation";
 import { TileMap } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -19,6 +20,7 @@ export const maxDuration = 60;
 
 const TICKS_PER_DAY = 96;
 const OBSERVATION_RADIUS = 6; // tiles — agents perceive others within this range
+const TALK_RADIUS = 3;         // tiles — max distance to initiate conversation
 const MEMORY_RETRIEVE_COUNT = 30; // top-N by cosine similarity before re-ranking
 const MEMORY_CONTEXT_COUNT = 10; // final top-N fed into decision prompt
 const INTERNAL_THOUGHT_CHANCE = 0.25; // probability when agent is idle
@@ -149,13 +151,18 @@ async function decideAction(
   memories: MemoryRow[],
   timeOfDay: string,
   day: number,
-): Promise<{ chosen_action: string; target_building: string | null; reasoning: string }> {
+  nearbyAgentNames: string[],
+): Promise<{ chosen_action: string; target_building: string | null; target_agent: string | null; reasoning: string }> {
   const memoryBlock =
     memories.length === 0
       ? "No relevant memories yet."
       : memories
           .map((m, i) => `${i + 1}. [${m.type}] ${m.content}`)
           .join("\n");
+
+  const talkOption = nearbyAgentNames.length > 0
+    ? `- talk_to: start a conversation with someone nearby. Set target_agent to their exact name. Nearby agents you could talk to: ${nearbyAgentNames.join(", ")}.`
+    : "";
 
   const system = `You are ${agent.name}, a character in a fantasy village simulation.
 Backstory: ${agent.backstory}
@@ -172,9 +179,10 @@ Available actions:
 - move_to: walk to a building. Set target_building to one of: inn, library, bakery, workshop, apothecary, plaza, park, cottage_1, cottage_2, cottage_3, cottage_4, cottage_5. Set to null to wander freely.
 - idle: stay put and reflect.
 - go_home: return to your cottage.
+${talkOption}
 
 It is ${timeOfDay} on day ${day}. Based on your personality, backstory, and memories, decide what to do next.
-Respond with JSON: { "chosen_action": "...", "target_building": "..." or null, "reasoning": "..." }`;
+Respond with JSON: { "chosen_action": "...", "target_building": "..." or null, "target_agent": "..." or null, "reasoning": "..." }`;
 
   return callJSON({
     model: MODEL_HIGH,
@@ -182,7 +190,7 @@ Respond with JSON: { "chosen_action": "...", "target_building": "..." or null, "
     user,
     schema: ActionDecisionSchema,
     temperature: 0.8,
-    maxTokens: 200,
+    maxTokens: 220,
   });
 }
 
@@ -324,6 +332,19 @@ export async function POST() {
   ]);
 
   // ── Phase 4: Action decisions (parallel, allSettled) ─────────────────────
+  // Build per-agent list of talkable nearby agent names
+  const nearbyTalkable = new Map<string, string[]>();
+  for (const agent of aiDeciders) {
+    if (agent.current_building) continue;
+    const nearby = agents.filter(
+      (a) =>
+        a.id !== agent.id &&
+        !a.current_building &&
+        dist(agent.current_x, agent.current_y, a.current_x, a.current_y) <= TALK_RADIUS,
+    ).map((a) => a.name);
+    nearbyTalkable.set(agent.id, nearby);
+  }
+
   const decisionResults = await Promise.allSettled(
     aiDeciders.map((a, i) =>
       decideAction(
@@ -332,6 +353,7 @@ export async function POST() {
         memoryResults[i].status === "fulfilled" ? memoryResults[i].value : [],
         newTimeOfDay,
         newDay,
+        nearbyTalkable.get(a.id) ?? [],
       ),
     ),
   );
@@ -538,9 +560,21 @@ export async function POST() {
       continue;
     }
 
+    // talk_to — handled in conversation pipeline below; mark as "talking" for now
+    if (decision.chosen_action === "talk_to") {
+      // Will be resolved in conversation pipeline. Hold the agent in place.
+      updates.push({
+        id: agent.id,
+        path: null,
+        next_decision_tick: newTick + 1,
+        status: "talking",
+      });
+      continue;
+    }
+
     // move_to
     if (decision.chosen_action === "move_to") {
-      const target = buildingEntry(decision.target_building, tilemap);
+      const target = buildingEntry(decision.target_building ?? null, tilemap);
       if (target) {
         const path = findPath(
           { x: agent.current_x, y: agent.current_y },
@@ -569,6 +603,143 @@ export async function POST() {
       if (planned) updates.push({ id: agent.id, path: planned, status: "walking" });
     }
   }
+
+  // ── Conversation pipeline ────────────────────────────────────────────────
+  // Match agents who decided to talk_to someone valid and nearby.
+  const agentById = new Map(agents.map((a) => [a.id, a]));
+  const agentByName = new Map(agents.map((a) => [a.name, a]));
+  const inConversation = new Set<string>();
+
+  type ConvoPayload = {
+    agentA: AgentRow; agentB: AgentRow;
+    relAtoB: RelationshipSnap | null; relBtoA: RelationshipSnap | null;
+    memsA: string[]; memsB: string[];
+    location: string;
+  };
+  const convoPairs: ConvoPayload[] = [];
+
+  for (let i = 0; i < aiDeciders.length; i++) {
+    const agent = aiDeciders[i];
+    const dr = decisionResults[i];
+    if (dr.status !== "fulfilled") continue;
+    if (dr.value.chosen_action !== "talk_to") continue;
+    if (inConversation.has(agent.id)) continue;
+
+    const targetName = dr.value.target_agent;
+    if (!targetName) continue;
+    const target = agentByName.get(targetName);
+    if (!target || inConversation.has(target.id)) continue;
+    if (target.current_building) continue;
+    if (dist(agent.current_x, agent.current_y, target.current_x, target.current_y) > TALK_RADIUS) continue;
+
+    // Fetch relationships
+    const [relAB, relBA] = await Promise.all([
+      supabase.from("relationships").select("*")
+        .eq("agent_id", agent.id).eq("target_id", target.id).maybeSingle(),
+      supabase.from("relationships").select("*")
+        .eq("agent_id", target.id).eq("target_id", agent.id).maybeSingle(),
+    ]);
+
+    // Fetch last 3 conversation memories for each agent mentioning the other
+    const [memARes, memBRes] = await Promise.all([
+      supabase.from("memories").select("content")
+        .eq("agent_id", agent.id).eq("type", "conversation")
+        .order("sim_tick", { ascending: false }).limit(3),
+      supabase.from("memories").select("content")
+        .eq("agent_id", target.id).eq("type", "conversation")
+        .order("sim_tick", { ascending: false }).limit(3),
+    ]);
+
+    inConversation.add(agent.id);
+    inConversation.add(target.id);
+
+    const snap = (row: typeof relAB.data): RelationshipSnap | null =>
+      row ? { familiarity: row.familiarity, sentiment: row.sentiment,
+               summary: row.summary, interaction_count: row.interaction_count } : null;
+
+    convoPairs.push({
+      agentA: agent, agentB: target,
+      relAtoB: snap(relAB.data), relBtoA: snap(relBA.data),
+      memsA: (memARes.data ?? []).map((m) => m.content),
+      memsB: (memBRes.data ?? []).map((m) => m.content),
+      location: describeLocation(agent, tilemap),
+    });
+  }
+
+  // Run all conversations in parallel (allSettled)
+  type ConvoResult = { agentA: AgentRow; agentB: AgentRow; result: Awaited<ReturnType<typeof runConversation>> };
+  const convoSettled = await Promise.allSettled(
+    convoPairs.map(async (p): Promise<ConvoResult> => ({
+      agentA: p.agentA,
+      agentB: p.agentB,
+      result: await runConversation(p.agentA, p.agentB, p.relAtoB, p.relBtoA, p.memsA, p.memsB, p.location),
+    })),
+  );
+
+  // Collect conversation outcomes for DB writes + tick response
+  type ConvoTurn = { speaker: string; speakerId: string; line: string; thought: string };
+  const convoSummaries: { agentAId: string; agentBId: string; agentAName: string; agentBName: string; turns: ConvoTurn[] }[] = [];
+  const now2 = new Date().toISOString();
+
+  for (const settled of convoSettled) {
+    if (settled.status === "rejected") {
+      console.error("Conversation failed:", settled.reason);
+      continue;
+    }
+    const { agentA, agentB, result } = settled.value;
+
+    // Store conversation log
+    const convoInsert = await supabase.from("conversations").insert({
+      agent_a_id: agentA.id, agent_b_id: agentB.id,
+      sim_tick: newTick, turns: result.turns,
+    }).select("id").single();
+
+    convoSummaries.push({
+      agentAId: agentA.id, agentBId: agentB.id,
+      agentAName: agentA.name, agentBName: agentB.name,
+      turns: result.turns,
+    });
+
+    // Store conversation memories for both agents
+    newMemories.push(
+      { agent_id: agentA.id, sim_tick: newTick, type: "conversation",
+        content: result.memoryA, embedding: null, importance: result.importance[0],
+        last_accessed: now2, access_count: 0 },
+      { agent_id: agentB.id, sim_tick: newTick, type: "conversation",
+        content: result.memoryB, embedding: null, importance: result.importance[1],
+        last_accessed: now2, access_count: 0 },
+    );
+
+    // Upsert relationships for both directions
+    const upsertRel = async (agentId: string, targetId: string, sentDelta: number, existingRel: RelationshipSnap | null) => {
+      const newFamiliarity = Math.min(1, (existingRel?.familiarity ?? 0) + 0.05);
+      const newSentiment = Math.max(-1, Math.min(1, (existingRel?.sentiment ?? 0) + sentDelta));
+      const newCount = (existingRel?.interaction_count ?? 0) + 1;
+
+      // Every 5 interactions, regenerate summary
+      let newSummary = existingRel?.summary ?? null;
+      if (newCount % 5 === 0) {
+        newSummary = result.relationshipNote;
+      }
+
+      await supabase.from("relationships").upsert({
+        agent_id: agentId, target_id: targetId,
+        familiarity: newFamiliarity, sentiment: newSentiment,
+        summary: newSummary, last_interaction_tick: newTick,
+        interaction_count: newCount,
+      }, { onConflict: "agent_id,target_id" });
+    };
+
+    await Promise.all([
+      upsertRel(agentA.id, agentB.id, result.sentimentDeltaA,
+        convoPairs.find(p => p.agentA.id === agentA.id && p.agentB.id === agentB.id)?.relAtoB ?? null),
+      upsertRel(agentB.id, agentA.id, result.sentimentDeltaB,
+        convoPairs.find(p => p.agentA.id === agentA.id && p.agentB.id === agentB.id)?.relBtoA ?? null),
+    ]);
+
+    void convoInsert;
+  }
+  void agentById;
 
   // ── Persist memories ─────────────────────────────────────────────────────
   if (newMemories.length > 0) {
@@ -609,5 +780,6 @@ export async function POST() {
     state: { ...sim, current_tick: newTick, current_day: newDay, time_of_day: newTimeOfDay },
     agents: freshAgents ?? [],
     memoriesAdded: newMemories.length,
+    conversations: convoSummaries,
   });
 }

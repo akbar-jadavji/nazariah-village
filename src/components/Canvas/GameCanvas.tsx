@@ -13,6 +13,20 @@ import { isPassable } from "@/engine/world";
 const CANVAS_PIXEL_W = MAP_WIDTH * TILE_SIZE;  // 1280
 const CANVAS_PIXEL_H = MAP_HEIGHT * TILE_SIZE; // 1280
 
+function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r = 4) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
 // Player movement interpolation speed (tiles per second)
 const MOVE_SPEED = 6;
 
@@ -44,6 +58,20 @@ type AgentServer = {
   status?: string;
 };
 
+type ConvoTurn = { speaker: string; speakerId: string; line: string; thought: string };
+type ConvoLog = {
+  agentAId: string; agentBId: string;
+  agentAName: string; agentBName: string;
+  turns: ConvoTurn[];
+  tick: number;
+};
+
+type SpeechBubble = {
+  agentId: string;
+  text: string;
+  expiresAt: number; // performance.now() timestamp
+};
+
 // Client-side rendering state for each agent — includes visual interpolation.
 type AgentRender = AgentServer & {
   prevX: number;
@@ -73,6 +101,9 @@ export default function GameCanvas() {
   const tickIntervalMsRef = useRef<number>(SPEED_INTERVALS_MS[1]);
   const tickingRef = useRef(false); // prevents overlapping tick requests
   const simStateRef = useRef<SimState | null>(null); // readable inside rAF loop
+  const speechBubblesRef = useRef<SpeechBubble[]>([]);
+  const [convoLog, setConvoLog] = useState<ConvoLog[]>([]);
+  const [logOpen, setLogOpen] = useState(false);
 
   const [agentCount, setAgentCount] = useState<number | null>(null);
   const [stateError, setStateError] = useState<string | null>(null);
@@ -218,10 +249,27 @@ export default function GameCanvas() {
           return;
         }
         const data = await res.json();
-        mergeAgents(data.agents ?? [], performance.now());
+        const now = performance.now();
+        mergeAgents(data.agents ?? [], now);
         if (data.state) {
           setSimState(data.state);
           simStateRef.current = data.state;
+        }
+        // Handle conversation results — set speech bubbles and update log
+        if (data.conversations && data.conversations.length > 0) {
+          const tick = data.state?.current_tick ?? 0;
+          const BUBBLE_DURATION = 6000; // ms each bubble stays visible
+          for (const convo of data.conversations as ConvoLog[]) {
+            // Last line of dialogue for each agent → speech bubble
+            const lastForA = [...convo.turns].reverse().find((t) => t.speakerId === convo.agentAId);
+            const lastForB = [...convo.turns].reverse().find((t) => t.speakerId === convo.agentBId);
+            if (lastForA) speechBubblesRef.current.push({ agentId: convo.agentAId, text: lastForA.line, expiresAt: now + BUBBLE_DURATION });
+            if (lastForB) speechBubblesRef.current.push({ agentId: convo.agentBId, text: lastForB.line, expiresAt: now + BUBBLE_DURATION });
+          }
+          setConvoLog((prev) => [
+            ...data.conversations.map((c: ConvoLog) => ({ ...c, tick })),
+            ...prev,
+          ].slice(0, 20)); // keep last 20 conversations
         }
       } catch (e) {
         setStateError(String(e).slice(0, 200));
@@ -442,6 +490,52 @@ export default function GameCanvas() {
         ctx.fillText(agent.name, lx, ly);
       }
 
+      // Speech bubbles — expire old ones, draw active
+      speechBubblesRef.current = speechBubblesRef.current.filter((b) => b.expiresAt > timestamp);
+      const agentMap = new Map(agentsRef.current.map((a) => [a.id, a]));
+      ctx.font = "8px monospace";
+      ctx.textAlign = "left";
+      for (const bubble of speechBubblesRef.current) {
+        const agent = agentMap.get(bubble.agentId);
+        if (!agent || agent.current_building) continue;
+        const t = Math.min(1, (timestamp - agent.tickArrivedAt) / tickIntervalMsRef.current);
+        const vx = agent.prevX + (agent.current_x - agent.prevX) * t;
+        const vy = agent.prevY + (agent.current_y - agent.prevY) * t;
+        const bx = vx * TILE_SIZE;
+        const by = vy * TILE_SIZE - 14;
+        // Wrap text at ~28 chars per line
+        const words = bubble.text.split(" ");
+        const lines: string[] = [];
+        let cur = "";
+        for (const w of words) {
+          if ((cur + w).length > 28) { lines.push(cur.trim()); cur = ""; }
+          cur += w + " ";
+        }
+        if (cur.trim()) lines.push(cur.trim());
+        const lh = 10;
+        const bw = Math.min(180, Math.max(...lines.map((l) => ctx.measureText(l).width)) + 8);
+        const bh = lines.length * lh + 6;
+        // Fade out in last 1500ms
+        const fadeAlpha = Math.min(1, (bubble.expiresAt - timestamp) / 1500);
+        ctx.globalAlpha = fadeAlpha;
+        ctx.fillStyle = "#fffde8";
+        ctx.strokeStyle = "#888";
+        ctx.lineWidth = 1;
+        roundRect(ctx, bx - 2, by - bh, bw, bh);
+        ctx.fill();
+        ctx.stroke();
+        // Tail
+        ctx.beginPath();
+        ctx.moveTo(bx + 6, by);
+        ctx.lineTo(bx + 12, by + 5);
+        ctx.lineTo(bx + 16, by);
+        ctx.fillStyle = "#fffde8";
+        ctx.fill();
+        ctx.fillStyle = "#333";
+        lines.forEach((line, i) => ctx.fillText(line, bx + 2, by - bh + lh * (i + 1)));
+        ctx.globalAlpha = 1;
+      }
+
       // Building/location labels
       ctx.font = "bold 10px monospace";
       ctx.textAlign = "center";
@@ -583,8 +677,39 @@ export default function GameCanvas() {
         tabIndex={0}
       />
       <p className="text-xs text-gray-500 mt-2 font-mono">
-        Chunk 4 — Memory System & AI Decision-Making
+        Chunk 5 — Conversations & Relationships
       </p>
+
+      {/* Conversation log panel */}
+      <div className="w-full max-w-2xl mt-3 font-mono text-xs">
+        <button
+          onClick={() => setLogOpen((o) => !o)}
+          className="w-full px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 text-left rounded flex justify-between items-center"
+        >
+          <span>Conversation Log ({convoLog.length})</span>
+          <span>{logOpen ? "▲" : "▼"}</span>
+        </button>
+        {logOpen && (
+          <div className="bg-gray-900 border border-gray-700 rounded-b max-h-64 overflow-y-auto p-2 space-y-3">
+            {convoLog.length === 0 ? (
+              <p className="text-gray-500 italic">No conversations yet. Agents will talk when they meet.</p>
+            ) : (
+              convoLog.map((c, i) => (
+                <div key={i} className="border-b border-gray-800 pb-2">
+                  <div className="text-gray-400 mb-1">
+                    Tick {c.tick} · {c.agentAName} &amp; {c.agentBName}
+                  </div>
+                  {c.turns.map((turn, j) => (
+                    <div key={j} className={turn.speakerId === c.agentAId ? "text-amber-300" : "text-sky-300"}>
+                      <span className="font-bold">{turn.speaker}:</span> {turn.line}
+                    </div>
+                  ))}
+                </div>
+              ))
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
