@@ -448,13 +448,30 @@ export async function POST() {
     });
   }
 
+  // Pre-compute which tiles walking agents will vacate this tick.
+  // This resolves swap-deadlocks: if A is at tile X and B wants X, A will
+  // vacate X → allow B to claim it (first-come in iteration order).
+  const willVacate = new Set<string>(walking.map((a) => keyOf(a.current_x, a.current_y)));
+  const claimedTiles = new Set<string>(); // prevents two agents claiming the same vacated tile
+
   // 2. Walking agents — advance one step
   for (const agent of walking) {
     const nextStep = agent.path![0];
     const nextKey = keyOf(nextStep.x, nextStep.y);
     const holder = occupancy.get(nextKey);
-    if (holder && holder !== agent.id) continue; // blocked — wait
 
+    if (holder && holder !== agent.id) {
+      if (willVacate.has(nextKey) && !claimedTiles.has(nextKey)) {
+        // Holder will vacate — allow this move (swap resolution).
+      } else {
+        // Truly blocked by a stationary agent or lost race for vacated tile.
+        // Clear path so the agent re-plans next tick rather than staying stuck.
+        updates.push({ id: agent.id, path: null, next_decision_tick: newTick + 1 + rand(2), status: "idle" });
+        continue;
+      }
+    }
+
+    claimedTiles.add(nextKey);
     occupancy.delete(keyOf(agent.current_x, agent.current_y));
     occupancy.set(nextKey, agent.id);
     const remaining = agent.path!.slice(1);
