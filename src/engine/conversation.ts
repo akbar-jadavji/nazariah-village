@@ -1,17 +1,23 @@
 /**
- * Conversation engine (Chunk 5)
+ * Conversation engine
  *
- * Drives a 2–4 turn GPT-4-turbo dialogue between two agents, then:
- *  - generates a per-agent conversation memory summary (GPT-4o-mini)
- *  - scores sentiment deltas and produces a relationship note (GPT-4o-mini)
+ * Drives a dynamic-length dialogue (2–8 turns) between two agents, then:
+ *  - scores sentiment deltas and produces a relationship note (gpt-4o-mini)
+ *  - builds per-agent memory summaries
+ *  - scores importance of those memories (gpt-4o-mini)
  *
- * Callers are responsible for all Supabase reads/writes — this module is
- * purely LLM orchestration and returns plain data.
+ * Turn flow:
+ *  - A always opens (turn 0)
+ *  - B must respond (turn 1)
+ *  - From turn 1 onwards either party may signal end_conversation: true
+ *  - When that happens the other party gets one closing turn, then the
+ *    conversation ends — so no question is ever left unanswered
+ *  - Hard cap: MAX_TURNS (8)
  */
 
 import {
   callJSON,
-  MODEL_HIGH, MODEL_LOW,
+  MODEL_LOW,
   ConversationTurnSchema, ConversationSentimentSchema, ImportanceScoresSchema,
 } from "@/lib/openai";
 import { AgentRow } from "@/lib/supabase";
@@ -28,23 +34,21 @@ export type RelationshipSnap = {
   sentiment: number;
   summary: string | null;
   interaction_count: number;
+  last_interaction_tick?: number;
 };
 
 export type ConversationResult = {
   turns: ConversationTurn[];
-  // Memory content to store for each agent (observation summary of the convo)
   memoryA: string;
   memoryB: string;
-  // Sentiment change for A's view of B, and B's view of A
   sentimentDeltaA: number;
   sentimentDeltaB: number;
-  // Short note about this interaction (for relationship summary)
   relationshipNote: string;
-  // Importance scores: [memoryA, memoryB]
   importance: [number, number];
 };
 
-const MAX_TURNS = 4;
+const MIN_TURNS = 2; // A opens + B responds at minimum
+const MAX_TURNS = 8; // hard cap
 
 function buildSpeakerSystemPrompt(
   speaker: AgentRow,
@@ -71,8 +75,8 @@ Backstory: ${speaker.backstory}
 Personality traits: ${speaker.traits.join(", ")}.
 You are talking with ${other.name}. ${famDesc}${sentDesc}${relSummary}
 It is currently ${timeOfDay} on Day ${day}.
-Ground all dialogue strictly in your current situation and memories. Do not mention places you have not visited, events not in your memories, or an incorrect time of day.
-Stay in character at all times. Keep dialogue natural and brief (1–3 sentences per turn).
+Ground all dialogue in your current situation and memories only. Do not mention places you have not visited, events not in your memories, or an incorrect time of day.
+Keep each line natural and brief (1–3 sentences). Match the conversational energy — if the other person is wrapping up, wrap up too.
 Always respond with valid JSON.`;
 }
 
@@ -81,15 +85,14 @@ export async function runConversation(
   agentB: AgentRow,
   relAtoB: RelationshipSnap | null,
   relBtoA: RelationshipSnap | null,
-  recentMemoriesA: string[], // last few memory contents mentioning B
-  recentMemoriesB: string[], // last few memory contents mentioning A
+  recentMemoriesA: string[],
+  recentMemoriesB: string[],
   location: string,
   timeOfDay: string,
   day: number,
 ): Promise<ConversationResult> {
   const turns: ConversationTurn[] = [];
 
-  // Build initial context strings
   const memCtxA = recentMemoriesA.length
     ? `Your memories involving ${agentB.name}:\n${recentMemoriesA.map((m, i) => `${i + 1}. ${m}`).join("\n")}`
     : `You have no prior memories involving ${agentB.name}.`;
@@ -98,59 +101,62 @@ export async function runConversation(
     ? `Your memories involving ${agentA.name}:\n${recentMemoriesB.map((m, i) => `${i + 1}. ${m}`).join("\n")}`
     : `You have no prior memories involving ${agentA.name}.`;
 
-  // ── Turn 1: A opens ─────────────────────────────────────────────────────
-  const turn1 = await callJSON({
-    model: MODEL_LOW,
-    system: buildSpeakerSystemPrompt(agentA, agentB, relAtoB, timeOfDay, day),
-    user: `You see ${agentB.name} at ${location}. ${memCtxA}
+  // pendingClose: the previous speaker signalled end_conversation — this turn is the wrap-up
+  let pendingClose = false;
+
+  for (let t = 0; t < MAX_TURNS; t++) {
+    const isA = t % 2 === 0;
+    const speaker  = isA ? agentA : agentB;
+    const other    = isA ? agentB : agentA;
+    const rel      = isA ? relAtoB : relBtoA;
+    const memCtx   = isA ? memCtxA : memCtxB;
+
+    let userPrompt: string;
+
+    if (t === 0) {
+      userPrompt = `You see ${other.name} at ${location}. ${memCtx}
 Start the conversation with a natural opening line grounded in your current situation.
-Respond with JSON: { "dialogue_line": "...", "internal_thought": "...", "end_conversation": false }`,
-    schema: ConversationTurnSchema,
-    temperature: 0.85,
-    maxTokens: 150,
-  });
-  turns.push({ speaker: agentA.name, speakerId: agentA.id, line: turn1.dialogue_line, thought: turn1.internal_thought });
+Respond with JSON: { "dialogue_line": "...", "internal_thought": "...", "end_conversation": false }`;
+    } else if (pendingClose) {
+      const lastLine = turns[turns.length - 1].line;
+      userPrompt = `${other.name} says: "${lastLine}"
+The conversation is wrapping up. Give a brief, natural closing response — answer any open question if there was one.
+Respond with JSON: { "dialogue_line": "...", "internal_thought": "...", "end_conversation": true }`;
+    } else {
+      const lastLine = turns[turns.length - 1].line;
+      const recentLines = turns.slice(-3).map((x) => `${x.speaker}: "${x.line}"`).join("\n");
+      const canEnd = t >= MIN_TURNS;
+      userPrompt = `Conversation so far:\n${recentLines}
+${other.name} just said: "${lastLine}"
+${memCtx}
+Respond naturally.${canEnd ? " If you have said what you needed to and the conversation feels complete, set end_conversation to true." : ""}
+Respond with JSON: { "dialogue_line": "...", "internal_thought": "...", "end_conversation": boolean }`;
+    }
 
-  // ── Turn 2: B responds ───────────────────────────────────────────────────
-  const turn2 = await callJSON({
-    model: MODEL_LOW,
-    system: buildSpeakerSystemPrompt(agentB, agentA, relBtoA, timeOfDay, day),
-    user: `You are at ${location}. ${memCtxB}
-${agentA.name} says: "${turn1.dialogue_line}"
-Respond naturally. If you want to end the conversation set end_conversation to true.
-Respond with JSON: { "dialogue_line": "...", "internal_thought": "...", "end_conversation": boolean }`,
-    schema: ConversationTurnSchema,
-    temperature: 0.85,
-    maxTokens: 150,
-  });
-  turns.push({ speaker: agentB.name, speakerId: agentB.id, line: turn2.dialogue_line, thought: turn2.internal_thought });
-
-  // ── Turns 3–4: continue if conversation isn't over ──────────────────────
-  if (!turn2.end_conversation && turns.length < MAX_TURNS) {
-    const turn3 = await callJSON({
+    const turn = await callJSON({
       model: MODEL_LOW,
-      system: buildSpeakerSystemPrompt(agentA, agentB, relAtoB, timeOfDay, day),
-      user: buildContinuePrompt(agentA.name, turns, agentB.name, true),
+      system: buildSpeakerSystemPrompt(speaker, other, rel, timeOfDay, day),
+      user: userPrompt,
       schema: ConversationTurnSchema,
       temperature: 0.85,
       maxTokens: 150,
     });
-    turns.push({ speaker: agentA.name, speakerId: agentA.id, line: turn3.dialogue_line, thought: turn3.internal_thought });
 
-    if (!turn3.end_conversation && turns.length < MAX_TURNS) {
-      const turn4 = await callJSON({
-        model: MODEL_LOW,
-        system: buildSpeakerSystemPrompt(agentB, agentA, relBtoA, timeOfDay, day),
-        user: buildContinuePrompt(agentB.name, turns, agentA.name, false),
-        schema: ConversationTurnSchema,
-        temperature: 0.85,
-        maxTokens: 150,
-      });
-      turns.push({ speaker: agentB.name, speakerId: agentB.id, line: turn4.dialogue_line, thought: turn4.internal_thought });
+    turns.push({
+      speaker: speaker.name,
+      speakerId: speaker.id,
+      line: turn.dialogue_line,
+      thought: turn.internal_thought,
+    });
+
+    if (pendingClose) break; // wrap-up just completed
+
+    if (turn.end_conversation && t >= MIN_TURNS - 1) {
+      pendingClose = true; // let the other party close
     }
   }
 
-  // ── Sentiment + relationship note (GPT-4o-mini) ──────────────────────────
+  // ── Sentiment + relationship note ────────────────────────────────────────
   const transcript = turns.map((t) => `${t.speaker}: "${t.line}"`).join("\n");
   const sentimentResult = await callJSON({
     model: MODEL_LOW,
@@ -163,11 +169,11 @@ Respond with JSON: { "sentiment_delta_a": float (-0.3 to 0.3), "sentiment_delta_
     maxTokens: 120,
   });
 
-  // ── Memory summaries (GPT-4o-mini) ────────────────────────────────────────
+  // ── Memory summaries ──────────────────────────────────────────────────────
   const summaryA = `I had a conversation with ${agentB.name} at ${location}. ${sentimentResult.relationship_note} They said: "${turns.find(t => t.speakerId === agentB.id)?.line ?? "..."}"`;
   const summaryB = `I had a conversation with ${agentA.name} at ${location}. ${sentimentResult.relationship_note} They said: "${turns.find(t => t.speakerId === agentA.id)?.line ?? "..."}"`;
 
-  // ── Importance scores for both memory entries ────────────────────────────
+  // ── Importance scores ─────────────────────────────────────────────────────
   let importance: [number, number] = [0.5, 0.5];
   try {
     const scores = await callJSON({
@@ -193,21 +199,4 @@ Respond with JSON: { "sentiment_delta_a": float (-0.3 to 0.3), "sentiment_delta_
     relationshipNote: sentimentResult.relationship_note,
     importance,
   };
-}
-
-function buildContinuePrompt(
-  speakerName: string,
-  turns: ConversationTurn[],
-  otherName: string,
-  speakerIsA: boolean,
-): string {
-  const last = turns[turns.length - 1];
-  const prior = turns
-    .slice(-3)
-    .map((t) => `${t.speaker}: "${t.line}"`)
-    .join("\n");
-  void speakerIsA;
-  return `Conversation so far:\n${prior}\n\n${last.speaker !== speakerName ? otherName : last.speaker} just said: "${last.line}"
-Continue your response naturally. If the conversation feels complete, set end_conversation to true.
-Respond with JSON: { "dialogue_line": "...", "internal_thought": "...", "end_conversation": boolean }`;
 }

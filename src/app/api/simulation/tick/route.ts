@@ -22,6 +22,7 @@ export const maxDuration = 60;
 const TICKS_PER_DAY = 96;
 const OBSERVATION_RADIUS = 6; // tiles — agents perceive others within this range
 const TALK_RADIUS = 3;         // tiles — max distance to initiate conversation
+const TALK_COOLDOWN_TICKS = 15; // min ticks before same pair can talk again
 const MEMORY_RETRIEVE_COUNT = 30; // top-N by cosine similarity before re-ranking
 const MEMORY_CONTEXT_COUNT = 10; // final top-N fed into decision prompt
 const INTERNAL_THOUGHT_CHANCE = 0.25; // probability when agent is idle
@@ -145,14 +146,14 @@ async function retrieveMemories(
     .slice(0, MEMORY_CONTEXT_COUNT);
 }
 
-/** GPT-4-turbo action decision. */
+/** Action decision (gpt-4o-mini). */
 async function decideAction(
   agent: AgentRow,
   observation: string,
   memories: MemoryRow[],
   timeOfDay: string,
   day: number,
-  nearbyAgentNames: string[],
+  nearbyAgents: { name: string; ticksSinceSpoke: number | null }[],
 ): Promise<{ chosen_action: string; target_building: string | null; target_agent: string | null; reasoning: string }> {
   const memoryBlock =
     memories.length === 0
@@ -161,8 +162,11 @@ async function decideAction(
           .map((m, i) => `${i + 1}. [${m.type}] ${m.content}`)
           .join("\n");
 
-  const talkOption = nearbyAgentNames.length > 0
-    ? `- talk_to: start a conversation with someone nearby. Set target_agent to their exact name. Nearby agents you could talk to: ${nearbyAgentNames.join(", ")}.`
+  const talkOption = nearbyAgents.length > 0
+    ? `- talk_to: start a conversation with someone nearby. Set target_agent to their exact name. Nearby agents:\n${nearbyAgents.map((a) => {
+        const recency = a.ticksSinceSpoke === null ? "never spoken" : `last spoke ${a.ticksSinceSpoke} ticks ago`;
+        return `  • ${a.name} (${recency})`;
+      }).join("\n")}`
     : "";
 
   const system = `You are ${agent.name}, a character in a fantasy village simulation.
@@ -183,6 +187,7 @@ Available actions:
 ${talkOption}
 
 It is ${timeOfDay} on day ${day}. Based on your personality, backstory, and memories, decide what to do next.
+Social note: Only choose talk_to if you have something meaningful to say, share, or ask. Avoid re-approaching someone you spoke with very recently unless you have a clear reason. Introverted or reserved characters should prefer solitary actions unless strongly motivated.
 Respond with JSON: { "chosen_action": "...", "target_building": "..." or null, "target_agent": "..." or null, "reasoning": "..." }`;
 
   return callJSON({
@@ -333,16 +338,32 @@ export async function POST() {
   ]);
 
   // ── Phase 4: Action decisions (parallel, allSettled) ─────────────────────
-  // Build per-agent list of talkable nearby agent names
-  const nearbyTalkable = new Map<string, string[]>();
+  // Build per-agent list of talkable nearby agents with recency context.
+  // Fetch last_interaction_tick from relationships for all pairs in one query.
+  const allRelRes = await supabase
+    .from("relationships")
+    .select("agent_id, target_id, last_interaction_tick")
+    .in("agent_id", aiDeciders.map((a) => a.id));
+  const relRecency = new Map<string, number>(); // "agentId:targetId" → tick
+  for (const r of allRelRes.data ?? []) {
+    if (r.last_interaction_tick) relRecency.set(`${r.agent_id}:${r.target_id}`, r.last_interaction_tick);
+  }
+
+  type NearbyAgent = { name: string; ticksSinceSpoke: number | null };
+  const nearbyTalkable = new Map<string, NearbyAgent[]>();
   for (const agent of aiDeciders) {
     if (agent.current_building) continue;
-    const nearby = agents.filter(
-      (a) =>
-        a.id !== agent.id &&
-        !a.current_building &&
-        dist(agent.current_x, agent.current_y, a.current_x, a.current_y) <= TALK_RADIUS,
-    ).map((a) => a.name);
+    const nearby: NearbyAgent[] = agents
+      .filter(
+        (a) =>
+          a.id !== agent.id &&
+          !a.current_building &&
+          dist(agent.current_x, agent.current_y, a.current_x, a.current_y) <= TALK_RADIUS,
+      )
+      .map((a) => {
+        const lastTick = relRecency.get(`${agent.id}:${a.id}`) ?? null;
+        return { name: a.name, ticksSinceSpoke: lastTick !== null ? newTick - lastTick : null };
+      });
     nearbyTalkable.set(agent.id, nearby);
   }
 
@@ -668,12 +689,20 @@ export async function POST() {
         .order("sim_tick", { ascending: false }).limit(3),
     ]);
 
+    // Cooldown: skip if they spoke within TALK_COOLDOWN_TICKS (allow 15% override for close friends)
+    const lastInteraction = relAB.data?.last_interaction_tick ?? 0;
+    if (lastInteraction > 0 && newTick - lastInteraction < TALK_COOLDOWN_TICKS) {
+      const familiarity = relAB.data?.familiarity ?? 0;
+      if (Math.random() > (familiarity > 0.7 ? 0.25 : 0.1)) continue;
+    }
+
     inConversation.add(agent.id);
     inConversation.add(target.id);
 
     const snap = (row: typeof relAB.data): RelationshipSnap | null =>
       row ? { familiarity: row.familiarity, sentiment: row.sentiment,
-               summary: row.summary, interaction_count: row.interaction_count } : null;
+               summary: row.summary, interaction_count: row.interaction_count,
+               last_interaction_tick: row.last_interaction_tick ?? undefined } : null;
 
     convoPairs.push({
       agentA: agent, agentB: target,
