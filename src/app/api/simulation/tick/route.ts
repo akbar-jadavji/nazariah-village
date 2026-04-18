@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { serverClient, AgentRow } from "@/lib/supabase";
 import { generateTileMap } from "@/data/tilemap";
 import { findPath } from "@/engine/pathfinding";
@@ -246,9 +246,17 @@ Respond with JSON: { "scores": [0.0, 0.5, ...] } — one score per memory, in th
 // Main handler
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function POST() {
+export async function POST(req: NextRequest) {
   const supabase = serverClient();
   const tilemap = generateTileMap();
+
+  // Optional player position — lets agents see and initiate chat with the player.
+  const body = await req.json().catch(() => ({})) as {
+    playerX?: number;
+    playerY?: number;
+    playerName?: string;
+  };
+  const { playerX, playerY, playerName } = body;
 
   // Load state + agents (full rows needed for backstory/traits in prompts)
   const [stateRes, agentsRes] = await Promise.all([
@@ -364,6 +372,17 @@ export async function POST() {
         const lastTick = relRecency.get(`${agent.id}:${a.id}`) ?? null;
         return { name: a.name, ticksSinceSpoke: lastTick !== null ? newTick - lastTick : null };
       });
+    // Add player as a potential conversation partner if they're nearby
+    if (playerX !== undefined && playerY !== undefined && playerName) {
+      if (dist(agent.current_x, agent.current_y, playerX, playerY) <= TALK_RADIUS) {
+        const playerLastTick = relRecency.get(`${agent.id}:player`) ?? null;
+        nearby.push({
+          name: playerName,
+          ticksSinceSpoke: playerLastTick !== null ? newTick - playerLastTick : null,
+        });
+      }
+    }
+
     nearbyTalkable.set(agent.id, nearby);
   }
 
@@ -713,6 +732,21 @@ export async function POST() {
     });
   }
 
+  // Collect agents that want to talk to the player (handled client-side via streaming chat).
+  type AgentChatRequest = { agentId: string; agentName: string };
+  const agentChatRequests: AgentChatRequest[] = [];
+  for (let i = 0; i < aiDeciders.length; i++) {
+    const agent = aiDeciders[i];
+    const dr = decisionResults[i];
+    if (dr.status !== "fulfilled") continue;
+    if (dr.value.chosen_action !== "talk_to") continue;
+    if (inConversation.has(agent.id)) continue;
+    const targetName = dr.value.target_agent;
+    if (playerName && targetName?.toLowerCase() === playerName.toLowerCase()) {
+      agentChatRequests.push({ agentId: agent.id, agentName: agent.name });
+    }
+  }
+
   // Run all conversations in parallel (allSettled)
   type ConvoResult = { agentA: AgentRow; agentB: AgentRow; result: Awaited<ReturnType<typeof runConversation>> };
   const convoSettled = await Promise.allSettled(
@@ -917,5 +951,6 @@ Respond with JSON: { "description": "...", "priority": 1-5, "steps": ["step1", "
     agents: freshAgents ?? [],
     memoriesAdded: newMemories.length,
     conversations: convoSummaries,
+    agentChatRequests,
   });
 }

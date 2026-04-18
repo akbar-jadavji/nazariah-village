@@ -29,6 +29,8 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
 
 // Player movement interpolation speed (tiles per second)
 const MOVE_SPEED = 6;
+// Must match TALK_RADIUS in the tick route
+const TALK_RADIUS = 3;
 
 // Animation frame rate (8fps means change frame every 125ms)
 const ANIM_FPS = 8;
@@ -152,8 +154,31 @@ export default function GameCanvas() {
   const [speed, setSpeed] = useState<number>(1);
   const [paused, setPaused] = useState(true);
 
-  // Keep inspectorIdRef in sync so the render loop can draw a selection ring
+  // ── Player identity ──────────────────────────────────────────────────────
+  const [playerName, setPlayerName] = useState("");
+  const [playerColor, setPlayerColor] = useState("#4060c0");
+  const playerNameRef = useRef("");
+  const playerColorRef = useRef("#4060c0");
+  const [showSetup, setShowSetup] = useState(false);
+  const [setupNameDraft, setSetupNameDraft] = useState("");
+  const [setupColorDraft, setSetupColorDraft] = useState("#4060c0");
+
+  // ── Player chat ───────────────────────────────────────────────────────────
+  const [chatAgentId, setChatAgentId] = useState<string | null>(null);
+  const chatAgentIdRef = useRef<string | null>(null);
+  const [chatAgentName, setChatAgentName] = useState("");
+  type ChatMsg = { role: "user" | "assistant"; content: string };
+  const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatStreaming, setChatStreaming] = useState(false);
+  const [agentChatRequests, setAgentChatRequests] = useState<{ agentId: string; agentName: string }[]>([]);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
+  // Keep refs in sync with state (render loop + keyboard handler read refs directly)
   inspectorIdRef.current = inspectorId;
+  playerColorRef.current = playerColor;
+  playerNameRef.current = playerName;
+  chatAgentIdRef.current = chatAgentId;
 
   // Zoom: responsiveScale fits canvas to window; userZoom is user-controlled multiplier
   const [responsiveScale, setResponsiveScale] = useState(1);
@@ -328,6 +353,20 @@ export default function GameCanvas() {
     tickIntervalMsRef.current = SPEED_INTERVALS_MS[speed] ?? 500;
   }, [speed]);
 
+  // Load player identity from localStorage on mount
+  useEffect(() => {
+    const name = localStorage.getItem("playerName");
+    const color = localStorage.getItem("playerColor") ?? "#4060c0";
+    if (name) {
+      setPlayerName(name);
+      setPlayerColor(color);
+      playerNameRef.current = name;
+      playerColorRef.current = color;
+    } else {
+      setShowSetup(true);
+    }
+  }, []);
+
   // Sim tick polling
   useEffect(() => {
     if (paused) return;
@@ -339,7 +378,16 @@ export default function GameCanvas() {
       if (stopped || tickingRef.current) return;
       tickingRef.current = true;
       try {
-        const res = await fetch("/api/simulation/tick", { method: "POST" });
+        const player = playerRef.current;
+        const res = await fetch("/api/simulation/tick", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            playerX: player.position.x,
+            playerY: player.position.y,
+            playerName: playerNameRef.current || undefined,
+          }),
+        });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
           setStateError(data.error ?? `HTTP ${res.status}`);
@@ -374,6 +422,15 @@ export default function GameCanvas() {
             return next;
           });
         }
+        // Handle agents that want to initiate chat with the player
+        if (data.agentChatRequests && data.agentChatRequests.length > 0 && !chatAgentIdRef.current) {
+          setAgentChatRequests((prev) => {
+            const existingIds = new Set(prev.map((r: { agentId: string }) => r.agentId));
+            const fresh = (data.agentChatRequests as { agentId: string; agentName: string }[])
+              .filter((r) => !existingIds.has(r.agentId));
+            return [...prev, ...fresh].slice(0, 3);
+          });
+        }
       } catch (e) {
         setStateError(String(e).slice(0, 200));
       } finally {
@@ -402,10 +459,54 @@ export default function GameCanvas() {
     }
   }, [paused]);
 
+  // Auto-scroll chat to bottom when new messages arrive
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages]);
+
   // Keyboard input
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // Don't intercept keys when typing in an input/textarea
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+
       const key = e.key.toLowerCase();
+
+      if (key === "escape") {
+        setChatAgentId(null);
+        chatAgentIdRef.current = null;
+        return;
+      }
+
+      if (key === "e") {
+        if (chatAgentIdRef.current) {
+          setChatAgentId(null);
+          chatAgentIdRef.current = null;
+          return;
+        }
+        // Find nearest agent within TALK_RADIUS
+        const player = playerRef.current;
+        let nearest: AgentRender | null = null;
+        let minD = Infinity;
+        for (const a of agentsRef.current) {
+          if (a.current_building) continue;
+          const d = Math.max(
+            Math.abs(a.current_x - player.position.x),
+            Math.abs(a.current_y - player.position.y),
+          );
+          if (d <= TALK_RADIUS && d < minD) { minD = d; nearest = a; }
+        }
+        if (nearest) {
+          setChatAgentId(nearest.id);
+          chatAgentIdRef.current = nearest.id;
+          setChatAgentName(nearest.name);
+          setChatMessages([]);
+          setChatInput("");
+        }
+        return;
+      }
+
       if (["w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(key)) {
         e.preventDefault();
         keysRef.current.add(key);
@@ -550,7 +651,7 @@ export default function GameCanvas() {
       const player = playerRef.current;
       drawables.push({
         y: player.visualY,
-        draw: () => drawCharacter(ctx, player.visualX, player.visualY, player.direction, player.animFrame, player.isMoving, "#4060c0"),
+        draw: () => drawCharacter(ctx, player.visualX, player.visualY, player.direction, player.animFrame, player.isMoving, playerColorRef.current),
       });
 
       drawables.sort((a, b) => a.y - b.y);
@@ -571,6 +672,57 @@ export default function GameCanvas() {
         ctx.fillRect(lx - textW / 2 - 3, ly - 9, textW + 6, 11);
         ctx.fillStyle = "#fff";
         ctx.fillText(agent.name, lx, ly);
+      }
+
+      // Player name label
+      if (playerNameRef.current) {
+        const plx = player.visualX * TILE_SIZE + TILE_SIZE / 2;
+        const ply = player.visualY * TILE_SIZE - 2;
+        ctx.font = "bold 9px monospace";
+        ctx.textAlign = "center";
+        const pLabel = playerNameRef.current + " ★";
+        const ptw = ctx.measureText(pLabel).width;
+        ctx.fillStyle = "rgba(0,0,0,0.7)";
+        ctx.fillRect(plx - ptw / 2 - 3, ply - 9, ptw + 6, 11);
+        ctx.fillStyle = "#ffd700";
+        ctx.fillText(pLabel, plx, ply);
+      }
+
+      // E-to-chat indicator: green ring around agents within TALK_RADIUS, "E" hint for closest
+      if (!chatAgentIdRef.current) {
+        let closestAgent: AgentRender | null = null;
+        let closestDist = Infinity;
+        for (const agent of agentsRef.current) {
+          if (agent.current_building) continue;
+          const d = Math.max(
+            Math.abs(agent.current_x - player.position.x),
+            Math.abs(agent.current_y - player.position.y),
+          );
+          if (d <= TALK_RADIUS) {
+            const t2 = Math.min(1, (timestamp - agent.tickArrivedAt) / agent.lerpDurationMs);
+            const vx2 = agent.prevX + (agent.current_x - agent.prevX) * t2;
+            const vy2 = agent.prevY + (agent.current_y - agent.prevY) * t2;
+            ctx.save();
+            ctx.strokeStyle = "#22c55e";
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([3, 2]);
+            ctx.beginPath();
+            ctx.arc(vx2 * TILE_SIZE + TILE_SIZE / 2, vy2 * TILE_SIZE + TILE_SIZE / 2, TILE_SIZE * 0.7, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.restore();
+            if (d < closestDist) { closestDist = d; closestAgent = agent; }
+          }
+        }
+        if (closestAgent) {
+          const t2 = Math.min(1, (timestamp - closestAgent.tickArrivedAt) / closestAgent.lerpDurationMs);
+          const vx2 = closestAgent.prevX + (closestAgent.current_x - closestAgent.prevX) * t2;
+          const vy2 = closestAgent.prevY + (closestAgent.current_y - closestAgent.prevY) * t2;
+          ctx.font = "bold 8px monospace";
+          ctx.textAlign = "center";
+          ctx.fillStyle = "#22c55e";
+          ctx.fillText("[E] chat", vx2 * TILE_SIZE + TILE_SIZE / 2, vy2 * TILE_SIZE + TILE_SIZE + 9);
+        }
       }
 
       // Record agent click bounds + draw selection ring for inspector
@@ -747,6 +899,59 @@ export default function GameCanvas() {
       .finally(() => setInspectorLoading(false));
   }, [inspectorId]);
 
+  // Confirm player setup
+  const confirmSetup = useCallback(() => {
+    const name = setupNameDraft.trim() || "Wanderer";
+    const color = setupColorDraft;
+    setPlayerName(name);
+    setPlayerColor(color);
+    playerNameRef.current = name;
+    playerColorRef.current = color;
+    localStorage.setItem("playerName", name);
+    localStorage.setItem("playerColor", color);
+    setShowSetup(false);
+  }, [setupNameDraft, setupColorDraft]);
+
+  // Send a player chat message to the selected agent (streaming)
+  const sendChatMessage = useCallback(async () => {
+    if (!chatInput.trim() || chatStreaming || !chatAgentId) return;
+    const message = chatInput.trim();
+    setChatInput("");
+    const outgoing: ChatMsg = { role: "user", content: message };
+    setChatMessages((prev) => [...prev, outgoing]);
+    setChatStreaming(true);
+    try {
+      const res = await fetch(`/api/agent/${chatAgentId}/chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          message,
+          playerName: playerNameRef.current || "Visitor",
+          history: chatMessages,
+        }),
+      });
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let agentText = "";
+      setChatMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        agentText += decoder.decode(value, { stream: true });
+        setChatMessages((prev) => {
+          const copy = [...prev];
+          copy[copy.length - 1] = { role: "assistant", content: agentText };
+          return copy;
+        });
+      }
+    } catch {
+      setChatMessages((prev) => [...prev, { role: "assistant", content: "(No response — try again)" }]);
+    } finally {
+      setChatStreaming(false);
+    }
+  }, [chatInput, chatStreaming, chatAgentId, chatMessages]);
+
   // Canvas click: check if any speech bubble was clicked
   const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const rect = canvasRef.current?.getBoundingClientRect();
@@ -913,7 +1118,7 @@ export default function GameCanvas() {
       </div>
 
       <p className="text-xs text-gray-500 mt-2 font-mono">
-        Chunk 6 — Reflections & Goals · Click an agent to inspect · Click speech bubbles to view dialogue
+        Chunk 7 — Player Integration · Press E near an agent to chat · Click agent to inspect
       </p>
 
       {/* Conversation log panel */}
@@ -954,6 +1159,146 @@ export default function GameCanvas() {
           </div>
         )}
       </div>
+      {/* Player name setup modal */}
+      {showSetup && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80">
+          <div className="bg-gray-900 border border-amber-700 rounded-xl p-6 w-80 font-mono text-sm shadow-2xl">
+            <h2 className="text-amber-200 font-bold text-base mb-1">Welcome to the Village</h2>
+            <p className="text-gray-400 text-xs mb-4">What shall you be called?</p>
+            <input
+              autoFocus
+              type="text"
+              placeholder="Enter your name…"
+              value={setupNameDraft}
+              onChange={(e) => setSetupNameDraft(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") confirmSetup(); }}
+              maxLength={20}
+              className="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 text-gray-100 text-sm mb-3 outline-none focus:border-amber-500"
+            />
+            <div className="mb-4">
+              <p className="text-gray-400 text-xs mb-2">Choose your colour:</p>
+              <div className="flex gap-2 flex-wrap">
+                {["#4060c0","#c04040","#40a040","#a040a0","#c08020","#208080","#808080"].map((c) => (
+                  <button
+                    key={c}
+                    onClick={() => setSetupColorDraft(c)}
+                    className="w-7 h-7 rounded-full border-2 transition-all"
+                    style={{
+                      background: c,
+                      borderColor: setupColorDraft === c ? "#ffd700" : "transparent",
+                      boxShadow: setupColorDraft === c ? "0 0 6px #ffd700" : "none",
+                    }}
+                  />
+                ))}
+              </div>
+            </div>
+            <button
+              onClick={confirmSetup}
+              className="w-full py-2 bg-amber-700 hover:bg-amber-600 text-white rounded font-bold"
+            >
+              Enter the Village
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Agent-initiated chat request notifications */}
+      {agentChatRequests.length > 0 && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 flex flex-col gap-2 font-mono text-xs">
+          {agentChatRequests.map((req) => (
+            <div key={req.agentId} className="flex items-center gap-3 bg-gray-900 border border-amber-600 rounded-lg px-4 py-2 shadow-lg">
+              <span className="text-amber-300">
+                <span className="font-bold">{req.agentName}</span> wants to talk to you
+              </span>
+              <button
+                onClick={() => {
+                  setChatAgentId(req.agentId);
+                  chatAgentIdRef.current = req.agentId;
+                  setChatAgentName(req.agentName);
+                  setChatMessages([]);
+                  setChatInput("");
+                  setAgentChatRequests((prev) => prev.filter((r) => r.agentId !== req.agentId));
+                }}
+                className="px-2 py-0.5 bg-amber-700 hover:bg-amber-600 text-white rounded text-xs"
+              >
+                Chat
+              </button>
+              <button
+                onClick={() => setAgentChatRequests((prev) => prev.filter((r) => r.agentId !== req.agentId))}
+                className="text-gray-500 hover:text-white"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Player chat panel */}
+      {chatAgentId && (
+        <div className="fixed bottom-0 right-0 z-40 w-80 h-96 flex flex-col bg-gray-900 border border-gray-700 rounded-tl-xl shadow-2xl font-mono text-xs">
+          {/* Header */}
+          <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800 bg-gray-950 rounded-tl-xl">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+              <span className="text-amber-200 font-bold">{chatAgentName}</span>
+            </div>
+            <button
+              onClick={() => { setChatAgentId(null); chatAgentIdRef.current = null; }}
+              className="text-gray-500 hover:text-white text-sm"
+            >
+              ✕
+            </button>
+          </div>
+          {/* Messages */}
+          <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
+            {chatMessages.length === 0 && (
+              <p className="text-gray-600 italic text-center mt-8">
+                Say something to {chatAgentName}…
+              </p>
+            )}
+            {chatMessages.map((msg, i) => (
+              <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+                <div
+                  className={`max-w-[85%] rounded-lg px-3 py-1.5 leading-relaxed ${
+                    msg.role === "user"
+                      ? "bg-amber-700/70 text-amber-100"
+                      : "bg-gray-800 text-gray-200"
+                  }`}
+                >
+                  {msg.content || <span className="opacity-50">…</span>}
+                </div>
+              </div>
+            ))}
+            {chatStreaming && chatMessages[chatMessages.length - 1]?.role === "user" && (
+              <div className="flex justify-start">
+                <div className="bg-gray-800 text-gray-400 rounded-lg px-3 py-1.5">…</div>
+              </div>
+            )}
+            <div ref={chatEndRef} />
+          </div>
+          {/* Input */}
+          <div className="flex gap-1 p-2 border-t border-gray-800">
+            <input
+              type="text"
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") sendChatMessage(); }}
+              placeholder="Type a message…"
+              disabled={chatStreaming}
+              className="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-gray-100 text-xs outline-none focus:border-amber-500 disabled:opacity-50"
+            />
+            <button
+              onClick={sendChatMessage}
+              disabled={chatStreaming || !chatInput.trim()}
+              className="px-3 py-1 bg-amber-700 hover:bg-amber-600 disabled:bg-gray-700 text-white rounded text-xs font-bold"
+            >
+              ↵
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Agent inspector overlay */}
       {inspectorId && (
         <div
