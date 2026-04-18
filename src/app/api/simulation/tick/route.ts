@@ -186,7 +186,7 @@ It is ${timeOfDay} on day ${day}. Based on your personality, backstory, and memo
 Respond with JSON: { "chosen_action": "...", "target_building": "..." or null, "target_agent": "..." or null, "reasoning": "..." }`;
 
   return callJSON({
-    model: MODEL_HIGH,
+    model: MODEL_LOW,
     system,
     user,
     schema: ActionDecisionSchema,
@@ -690,7 +690,7 @@ export async function POST() {
     convoPairs.map(async (p): Promise<ConvoResult> => ({
       agentA: p.agentA,
       agentB: p.agentB,
-      result: await runConversation(p.agentA, p.agentB, p.relAtoB, p.relBtoA, p.memsA, p.memsB, p.location),
+      result: await runConversation(p.agentA, p.agentB, p.relAtoB, p.relBtoA, p.memsA, p.memsB, p.location, newTimeOfDay, newDay),
     })),
   );
 

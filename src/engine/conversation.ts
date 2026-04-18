@@ -46,7 +46,13 @@ export type ConversationResult = {
 
 const MAX_TURNS = 4;
 
-function buildSpeakerSystemPrompt(speaker: AgentRow, other: AgentRow, rel: RelationshipSnap | null): string {
+function buildSpeakerSystemPrompt(
+  speaker: AgentRow,
+  other: AgentRow,
+  rel: RelationshipSnap | null,
+  timeOfDay: string,
+  day: number,
+): string {
   const famDesc = !rel ? "You have never met them before."
     : rel.familiarity < 0.2 ? "You have barely met them."
     : rel.familiarity < 0.5 ? "You know them a little."
@@ -64,6 +70,8 @@ function buildSpeakerSystemPrompt(speaker: AgentRow, other: AgentRow, rel: Relat
 Backstory: ${speaker.backstory}
 Personality traits: ${speaker.traits.join(", ")}.
 You are talking with ${other.name}. ${famDesc}${sentDesc}${relSummary}
+It is currently ${timeOfDay} on Day ${day}.
+Ground all dialogue strictly in your current situation and memories. Do not mention places you have not visited, events not in your memories, or an incorrect time of day.
 Stay in character at all times. Keep dialogue natural and brief (1–3 sentences per turn).
 Always respond with valid JSON.`;
 }
@@ -76,6 +84,8 @@ export async function runConversation(
   recentMemoriesA: string[], // last few memory contents mentioning B
   recentMemoriesB: string[], // last few memory contents mentioning A
   location: string,
+  timeOfDay: string,
+  day: number,
 ): Promise<ConversationResult> {
   const turns: ConversationTurn[] = [];
 
@@ -90,10 +100,10 @@ export async function runConversation(
 
   // ── Turn 1: A opens ─────────────────────────────────────────────────────
   const turn1 = await callJSON({
-    model: MODEL_HIGH,
-    system: buildSpeakerSystemPrompt(agentA, agentB, relAtoB),
+    model: MODEL_LOW,
+    system: buildSpeakerSystemPrompt(agentA, agentB, relAtoB, timeOfDay, day),
     user: `You see ${agentB.name} at ${location}. ${memCtxA}
-Start the conversation with a natural opening line.
+Start the conversation with a natural opening line grounded in your current situation.
 Respond with JSON: { "dialogue_line": "...", "internal_thought": "...", "end_conversation": false }`,
     schema: ConversationTurnSchema,
     temperature: 0.85,
@@ -103,8 +113,8 @@ Respond with JSON: { "dialogue_line": "...", "internal_thought": "...", "end_con
 
   // ── Turn 2: B responds ───────────────────────────────────────────────────
   const turn2 = await callJSON({
-    model: MODEL_HIGH,
-    system: buildSpeakerSystemPrompt(agentB, agentA, relBtoA),
+    model: MODEL_LOW,
+    system: buildSpeakerSystemPrompt(agentB, agentA, relBtoA, timeOfDay, day),
     user: `You are at ${location}. ${memCtxB}
 ${agentA.name} says: "${turn1.dialogue_line}"
 Respond naturally. If you want to end the conversation set end_conversation to true.
@@ -118,8 +128,8 @@ Respond with JSON: { "dialogue_line": "...", "internal_thought": "...", "end_con
   // ── Turns 3–4: continue if conversation isn't over ──────────────────────
   if (!turn2.end_conversation && turns.length < MAX_TURNS) {
     const turn3 = await callJSON({
-      model: MODEL_HIGH,
-      system: buildSpeakerSystemPrompt(agentA, agentB, relAtoB),
+      model: MODEL_LOW,
+      system: buildSpeakerSystemPrompt(agentA, agentB, relAtoB, timeOfDay, day),
       user: buildContinuePrompt(agentA.name, turns, agentB.name, true),
       schema: ConversationTurnSchema,
       temperature: 0.85,
@@ -129,8 +139,8 @@ Respond with JSON: { "dialogue_line": "...", "internal_thought": "...", "end_con
 
     if (!turn3.end_conversation && turns.length < MAX_TURNS) {
       const turn4 = await callJSON({
-        model: MODEL_HIGH,
-        system: buildSpeakerSystemPrompt(agentB, agentA, relBtoA),
+        model: MODEL_LOW,
+        system: buildSpeakerSystemPrompt(agentB, agentA, relBtoA, timeOfDay, day),
         user: buildContinuePrompt(agentB.name, turns, agentA.name, false),
         schema: ConversationTurnSchema,
         temperature: 0.85,
