@@ -131,6 +131,16 @@ export const GoalSchema = z.object({
   steps: z.array(z.string()).max(5),
 });
 
+// Schema for a social event extracted from a conversation or reflection.
+// scheduled_day_offset: how many sim-days from now (0 = today, 1 = tomorrow…)
+export const SocialEventSchema = z.object({
+  title: z.string().max(80),
+  description: z.string().max(200),
+  location: z.enum(["inn", "library", "bakery", "workshop", "apothecary", "plaza", "park"]),
+  scheduled_day_offset: z.number().int().min(0).max(7),
+  scheduled_time_of_day: z.enum(["morning", "midday", "afternoon", "evening"]),
+});
+
 // Schema for extracting commitments/plans made during a conversation.
 // agentA_goal / agentB_goal are null if that agent made no concrete commitment.
 const CommitmentGoalSchema = z.object({
