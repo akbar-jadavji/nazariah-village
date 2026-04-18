@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { serverClient } from "@/lib/supabase";
-import { openai, MODEL_LOW } from "@/lib/openai";
+import { z } from "zod";
+import { openai, MODEL_LOW, callJSON } from "@/lib/openai";
 
 export const runtime = "nodejs";
 
@@ -8,6 +9,7 @@ type HistoryMessage = { role: "user" | "assistant"; content: string };
 
 async function storePlayerInteraction(
   agentId: string,
+  agentName: string,
   playerName: string,
   playerMessage: string,
   agentResponse: string,
@@ -61,6 +63,34 @@ async function storePlayerInteraction(
       { onConflict: "agent_id,target_id" },
     ),
   ]);
+
+  // Extract any commitment the agent made to the player and create a goal
+  try {
+    const extraction = await callJSON({
+      model: MODEL_LOW,
+      system: `You extract concrete commitments an agent makes to a player.
+A commitment is a clear, actionable agreement: "let's go to X together", "I'll take you to Y", "meet me at Z", "I'll show you around".
+Vague replies ("sounds nice", "maybe", "I enjoy going there") are NOT commitments.
+If ${agentName} made a concrete commitment, return a goal. Otherwise return description: null.
+Respond with JSON: { "description": "..." | null, "priority": 1-5, "steps": ["..."] }`,
+      user: `${playerName} said: "${playerMessage}"\n${agentName} replied: "${agentResponse}"`,
+      schema: z.object({ description: z.string().max(200).nullable(), priority: z.number().min(1).max(5).int().default(3), steps: z.array(z.string()).max(3).default([]) }),
+      temperature: 0.2,
+      maxTokens: 150,
+    });
+
+    if (extraction.description) {
+      await supabase.from("goals").insert({
+        agent_id: agentId,
+        description: extraction.description,
+        priority: extraction.priority ?? 3,
+        status: "active",
+        steps: extraction.steps ?? [],
+        created_at_tick: tick,
+        completed_at_tick: null,
+      });
+    }
+  } catch { /* non-fatal */ }
 }
 
 export async function POST(
@@ -184,7 +214,7 @@ Respond only with your spoken dialogue — no narration or stage directions.`;
       } finally {
         controller.close();
         if (fullText) {
-          storePlayerInteraction(id, playerName, message, fullText, supabase).catch(
+          storePlayerInteraction(id, agent.name, playerName, message, fullText, supabase).catch(
             (e) => console.error("player interaction store failed:", e),
           );
         }

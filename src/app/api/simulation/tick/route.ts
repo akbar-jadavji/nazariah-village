@@ -146,11 +146,14 @@ async function retrieveMemories(
     .slice(0, MEMORY_CONTEXT_COUNT);
 }
 
+type GoalSnap = { description: string; steps: string[] | null; priority: number };
+
 /** Action decision (gpt-4o-mini). */
 async function decideAction(
   agent: AgentRow,
   observation: string,
   memories: MemoryRow[],
+  activeGoals: GoalSnap[],
   timeOfDay: string,
   day: number,
   nearbyAgents: { name: string; ticksSinceSpoke: number | null }[],
@@ -161,6 +164,17 @@ async function decideAction(
       : memories
           .map((m, i) => `${i + 1}. [${m.type}] ${m.content}`)
           .join("\n");
+
+  const goalBlock = activeGoals.length === 0
+    ? "No active goals."
+    : activeGoals
+        .map((g, i) => {
+          const steps = Array.isArray(g.steps) && g.steps.length > 0
+            ? ` Steps: ${g.steps.join(" → ")}`
+            : "";
+          return `${i + 1}. [priority ${g.priority}/5] ${g.description}${steps}`;
+        })
+        .join("\n");
 
   const talkOption = nearbyAgents.length > 0
     ? `- talk_to: start a conversation with someone nearby. Set target_agent to their exact name. Nearby agents:\n${nearbyAgents.map((a) => {
@@ -177,6 +191,9 @@ Always respond with valid JSON only.`;
 
   const user = `Current observation: ${observation}
 
+Active goals (these are your current intentions — act on them):
+${goalBlock}
+
 Recent relevant memories:
 ${memoryBlock}
 
@@ -186,8 +203,8 @@ Available actions:
 - go_home: return to your cottage.
 ${talkOption}
 
-It is ${timeOfDay} on day ${day}. Based on your personality, backstory, and memories, decide what to do next.
-Social note: Only choose talk_to if you have something meaningful to say, share, or ask. Avoid re-approaching someone you spoke with very recently unless you have a clear reason. Introverted or reserved characters should prefer solitary actions unless strongly motivated.
+It is ${timeOfDay} on day ${day}. Prioritise acting on your active goals. If a goal says to meet someone or go somewhere, do it.
+Social note: Only choose talk_to if you have something meaningful to say, share, or ask. Avoid re-approaching someone you spoke with very recently unless you have a clear reason.
 Respond with JSON: { "chosen_action": "...", "target_building": "..." or null, "target_agent": "..." or null, "reasoning": "..." }`;
 
   return callJSON({
@@ -320,13 +337,28 @@ export async function POST(req: NextRequest) {
     ? needsDecision.filter((a) => a.current_building === a.home_building_id)
     : needsDecision;
 
-  // ── Phase 1: Build observations ──────────────────────────────────────────
+  // ── Phase 1: Build observations + fetch active goals ─────────────────────
   const observations: Map<string, string> = new Map();
   for (const agent of aiDeciders) {
     observations.set(
       agent.id,
       buildObservation(agent, agents, tilemap, newTick, newTimeOfDay, newDay),
     );
+  }
+
+  // Fetch active goals for all decision-making agents in one query
+  const { data: goalsData } = await supabase
+    .from("goals")
+    .select("agent_id, description, steps, priority")
+    .in("agent_id", aiDeciders.map((a) => a.id))
+    .eq("status", "active")
+    .order("priority", { ascending: false });
+
+  const goalsByAgent = new Map<string, GoalSnap[]>();
+  for (const g of goalsData ?? []) {
+    const arr = goalsByAgent.get(g.agent_id) ?? [];
+    arr.push({ description: g.description, steps: g.steps as string[] | null, priority: g.priority });
+    goalsByAgent.set(g.agent_id, arr);
   }
 
   // ── Phase 2: Embed observations (parallel) ───────────────────────────────
@@ -392,6 +424,7 @@ export async function POST(req: NextRequest) {
         a,
         observations.get(a.id)!,
         memoryResults[i].status === "fulfilled" ? memoryResults[i].value : [],
+        goalsByAgent.get(a.id) ?? [],
         newTimeOfDay,
         newDay,
         nearbyTalkable.get(a.id) ?? [],
@@ -811,12 +844,31 @@ export async function POST(req: NextRequest) {
       }, { onConflict: "agent_id,target_id" });
     };
 
+    const pair = convoPairs.find(p => p.agentA.id === agentA.id && p.agentB.id === agentB.id);
     await Promise.all([
-      upsertRel(agentA.id, agentB.id, result.sentimentDeltaA,
-        convoPairs.find(p => p.agentA.id === agentA.id && p.agentB.id === agentB.id)?.relAtoB ?? null),
-      upsertRel(agentB.id, agentA.id, result.sentimentDeltaB,
-        convoPairs.find(p => p.agentA.id === agentA.id && p.agentB.id === agentB.id)?.relBtoA ?? null),
+      upsertRel(agentA.id, agentB.id, result.sentimentDeltaA, pair?.relAtoB ?? null),
+      upsertRel(agentB.id, agentA.id, result.sentimentDeltaB, pair?.relBtoA ?? null),
     ]);
+
+    // Persist commitment-based goals formed during this conversation
+    const commitmentInserts = [
+      result.commitmentA ? { agent_id: agentA.id, goal: result.commitmentA } : null,
+      result.commitmentB ? { agent_id: agentB.id, goal: result.commitmentB } : null,
+    ].filter(Boolean) as { agent_id: string; goal: typeof result.commitmentA & object }[];
+
+    if (commitmentInserts.length > 0) {
+      await supabase.from("goals").insert(
+        commitmentInserts.map(({ agent_id, goal }) => ({
+          agent_id,
+          description: goal.description,
+          priority: goal.priority,
+          status: "active",
+          steps: goal.steps,
+          created_at_tick: newTick,
+          completed_at_tick: null,
+        })),
+      );
+    }
 
     void convoInsert;
   }

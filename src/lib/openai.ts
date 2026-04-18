@@ -130,3 +130,15 @@ export const GoalSchema = z.object({
   priority: z.number().min(1).max(5).int(),
   steps: z.array(z.string()).max(5),
 });
+
+// Schema for extracting commitments/plans made during a conversation.
+// agentA_goal / agentB_goal are null if that agent made no concrete commitment.
+const CommitmentGoalSchema = z.object({
+  description: z.string().max(200),
+  steps: z.array(z.string()).max(3),
+  priority: z.number().min(1).max(5).int(),
+});
+export const ConversationCommitmentsSchema = z.object({
+  agentA_goal: CommitmentGoalSchema.nullable(),
+  agentB_goal: CommitmentGoalSchema.nullable(),
+});

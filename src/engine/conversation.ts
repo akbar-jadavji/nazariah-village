@@ -19,6 +19,7 @@ import {
   callJSON,
   MODEL_LOW,
   ConversationTurnSchema, ConversationSentimentSchema, ImportanceScoresSchema,
+  ConversationCommitmentsSchema,
 } from "@/lib/openai";
 import { AgentRow } from "@/lib/supabase";
 
@@ -37,6 +38,8 @@ export type RelationshipSnap = {
   last_interaction_tick?: number;
 };
 
+type CommitmentGoal = { description: string; steps: string[]; priority: number };
+
 export type ConversationResult = {
   turns: ConversationTurn[];
   memoryA: string;
@@ -45,6 +48,9 @@ export type ConversationResult = {
   sentimentDeltaB: number;
   relationshipNote: string;
   importance: [number, number];
+  // Goals extracted from commitments/plans made during this conversation (null = none)
+  commitmentA: CommitmentGoal | null;
+  commitmentB: CommitmentGoal | null;
 };
 
 const MIN_TURNS = 2; // A opens + B responds at minimum
@@ -190,6 +196,28 @@ Respond with JSON: { "sentiment_delta_a": float (-0.3 to 0.3), "sentiment_delta_
     ];
   } catch { /* keep defaults */ }
 
+  // ── Commitment extraction ────────────────────────────────────────────────
+  // Look for concrete plans or promises made (e.g. "let's go to the inn",
+  // "I'll meet you at the bakery") and surface them as goals.
+  let commitmentA: CommitmentGoal | null = null;
+  let commitmentB: CommitmentGoal | null = null;
+  try {
+    const commitments = await callJSON({
+      model: MODEL_LOW,
+      system: `You extract concrete commitments or plans made during a conversation between two characters.
+A commitment is a clear, actionable promise or agreement: "let's go to X", "I'll meet you at Y", "I'll help you with Z".
+Vague intentions ("maybe someday", "that sounds nice") are NOT commitments.
+Return null for an agent if they made no concrete commitment.
+Respond with JSON: { "agentA_goal": { "description": "...", "steps": ["..."], "priority": 1-5 } | null, "agentB_goal": ... | null }`,
+      user: `${agentA.name} (agentA) and ${agentB.name} (agentB) had this conversation:\n${transcript}\n\nDid either agent make a concrete commitment or plan?`,
+      schema: ConversationCommitmentsSchema,
+      temperature: 0.2,
+      maxTokens: 200,
+    });
+    commitmentA = commitments.agentA_goal ?? null;
+    commitmentB = commitments.agentB_goal ?? null;
+  } catch { /* non-fatal */ }
+
   return {
     turns,
     memoryA: summaryA,
@@ -198,5 +226,7 @@ Respond with JSON: { "sentiment_delta_a": float (-0.3 to 0.3), "sentiment_delta_
     sentimentDeltaB: sentimentResult.sentiment_delta_b,
     relationshipNote: sentimentResult.relationship_note,
     importance,
+    commitmentA,
+    commitmentB,
   };
 }
