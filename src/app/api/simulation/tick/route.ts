@@ -7,9 +7,9 @@ import {
   callJSON, embed,
   MODEL_LOW,
   ActionDecisionSchema, ImportanceScoresSchema, InternalThoughtSchema,
-  ReflectionSchema, GoalSchema, SocialEventSchema,
+  ReflectionSchema, GoalSchema,
 } from "@/lib/openai";
-import { runConversation, RelationshipSnap, UpcomingEvent } from "@/engine/conversation";
+import { runConversation, RelationshipSnap } from "@/engine/conversation";
 import { TileMap } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -154,7 +154,6 @@ async function decideAction(
   observation: string,
   memories: MemoryRow[],
   activeGoals: GoalSnap[],
-  upcomingEvents: UpcomingEvent[],
   timeOfDay: string,
   day: number,
   nearbyAgents: { name: string; ticksSinceSpoke: number | null }[],
@@ -177,13 +176,6 @@ async function decideAction(
         })
         .join("\n");
 
-  const eventBlock = upcomingEvents.length === 0
-    ? ""
-    : `\nEvents you know about:\n${upcomingEvents.map((e) =>
-        `- "${e.title}" at the ${e.location}, Day ${e.scheduledDay} ${e.scheduledTimeOfDay}` +
-        (e.organizerName === agent.name ? " (you are hosting — go there when it's time)" : ` (hosted by ${e.organizerName} — attend if you want)`)
-      ).join("\n")}`;
-
   const talkOption = nearbyAgents.length > 0
     ? `- talk_to: start a conversation with someone nearby. Set target_agent to their exact name. Nearby agents:\n${nearbyAgents.map((a) => {
         const recency = a.ticksSinceSpoke === null ? "never spoken" : `last spoke ${a.ticksSinceSpoke} ticks ago`;
@@ -201,7 +193,7 @@ Always respond with valid JSON only.`;
 
 Active goals (these are your current intentions — act on them):
 ${goalBlock}
-${eventBlock}
+
 Recent relevant memories:
 ${memoryBlock}
 
@@ -369,48 +361,6 @@ export async function POST(req: NextRequest) {
     goalsByAgent.set(g.agent_id, arr);
   }
 
-  // ── Event lifecycle ───────────────────────────────────────────────────────
-  // Mark events that are happening right now as "active"
-  await supabase
-    .from("events")
-    .update({ status: "active" })
-    .eq("status", "upcoming")
-    .eq("scheduled_day", newDay)
-    .eq("scheduled_time_of_day", newTimeOfDay);
-
-  // End events from previous time periods
-  await supabase
-    .from("events")
-    .update({ status: "ended" })
-    .eq("status", "active")
-    .or(`scheduled_day.lt.${newDay},and(scheduled_day.eq.${newDay},scheduled_time_of_day.neq.${newTimeOfDay})`);
-
-  // Fetch events agents are aware of (upcoming within 5 days + currently active)
-  const { data: eventsData } = await supabase
-    .from("events")
-    .select("id, organizer_id, title, location, scheduled_day, scheduled_time_of_day, status")
-    .in("status", ["upcoming", "active"])
-    .lte("scheduled_day", newDay + 5)
-    .order("scheduled_day", { ascending: true });
-
-  // Build organizer name lookup
-  const agentNameById = new Map(agents.map((a) => [a.id, a.name]));
-
-  // Map events to UpcomingEvent shape; agents "know about" events via their memories.
-  // For simplicity: organizer always knows; other agents know if they have a memory
-  // mentioning the event title. We'll approximate by sharing all upcoming events with
-  // the organizer and events whose title appears in the agent's retrieved memories.
-  const allUpcomingEvents: UpcomingEvent[] = (eventsData ?? []).map((e) => ({
-    id: e.id,
-    title: e.title,
-    location: e.location,
-    scheduledDay: e.scheduled_day,
-    scheduledTimeOfDay: e.scheduled_time_of_day,
-    organizerName: agentNameById.get(e.organizer_id) ?? "Unknown",
-  }));
-
-  // eventsByAgent is computed after Phase 3 (needs memoryResults)
-
   // ── Phase 2: Embed observations (parallel) ───────────────────────────────
   const embeddingResults = await Promise.allSettled(
     aiDeciders.map((a) => embed(observations.get(a.id)!)),
@@ -426,22 +376,6 @@ export async function POST(req: NextRequest) {
       }),
     ),
   ]);
-
-  // ── Build eventsByAgent (needs memoryResults) ────────────────────────────
-  const eventsByAgent = new Map<string, UpcomingEvent[]>();
-  for (let i = 0; i < aiDeciders.length; i++) {
-    const agent = aiDeciders[i];
-    const agentMemoryTexts = (memoryResults[i].status === "fulfilled"
-      ? (memoryResults[i] as PromiseFulfilledResult<MemoryRow[]>).value
-      : []
-    ).map((m) => m.content.toLowerCase());
-
-    const known = allUpcomingEvents.filter((e) =>
-      e.organizerName === agent.name ||
-      agentMemoryTexts.some((txt) => txt.includes(e.title.toLowerCase())),
-    );
-    eventsByAgent.set(agent.id, known);
-  }
 
   // ── Phase 4: Action decisions (parallel, allSettled) ─────────────────────
   // Build per-agent list of talkable nearby agents with recency context.
@@ -491,7 +425,6 @@ export async function POST(req: NextRequest) {
         observations.get(a.id)!,
         memoryResults[i].status === "fulfilled" ? memoryResults[i].value : [],
         goalsByAgent.get(a.id) ?? [],
-        eventsByAgent.get(a.id) ?? [],
         newTimeOfDay,
         newDay,
         nearbyTalkable.get(a.id) ?? [],
@@ -773,7 +706,6 @@ export async function POST(req: NextRequest) {
     relAtoB: RelationshipSnap | null; relBtoA: RelationshipSnap | null;
     memsA: string[]; memsB: string[];
     location: string;
-    eventsA: UpcomingEvent[]; eventsB: UpcomingEvent[];
   };
   const convoPairs: ConvoPayload[] = [];
 
@@ -830,8 +762,6 @@ export async function POST(req: NextRequest) {
       memsA: (memARes.data ?? []).map((m) => m.content),
       memsB: (memBRes.data ?? []).map((m) => m.content),
       location: describeLocation(agent, tilemap),
-      eventsA: eventsByAgent.get(agent.id) ?? [],
-      eventsB: eventsByAgent.get(target.id) ?? [],
     });
   }
 
@@ -856,7 +786,7 @@ export async function POST(req: NextRequest) {
     convoPairs.map(async (p): Promise<ConvoResult> => ({
       agentA: p.agentA,
       agentB: p.agentB,
-      result: await runConversation(p.agentA, p.agentB, p.relAtoB, p.relBtoA, p.memsA, p.memsB, p.location, newTimeOfDay, newDay, p.eventsA, p.eventsB),
+      result: await runConversation(p.agentA, p.agentB, p.relAtoB, p.relBtoA, p.memsA, p.memsB, p.location, newTimeOfDay, newDay),
     })),
   );
 
@@ -938,36 +868,6 @@ export async function POST(req: NextRequest) {
           completed_at_tick: null,
         })),
       );
-    }
-
-    // Persist social event planned during this conversation
-    if (result.socialEvent) {
-      const organizerId = result.socialEvent.organizerIsA ? agentA.id : agentB.id;
-      const scheduledDay = newDay + result.socialEvent.scheduledDayOffset;
-      const { data: eventRow } = await supabase.from("events").insert({
-        organizer_id: organizerId,
-        title: result.socialEvent.title,
-        description: result.socialEvent.description,
-        location: result.socialEvent.location,
-        scheduled_day: scheduledDay,
-        scheduled_time_of_day: result.socialEvent.scheduledTimeOfDay,
-        status: "upcoming",
-        created_at_tick: newTick,
-      }).select("id, title").single();
-
-      // Both participants get a "heard about event" memory
-      if (eventRow) {
-        const eventMemContent = (name: string) =>
-          `I heard about "${eventRow.title}" — ${result.socialEvent!.description} at the ${result.socialEvent!.location} on Day ${scheduledDay} ${result.socialEvent!.scheduledTimeOfDay}.`;
-        newMemories.push(
-          { agent_id: agentA.id, sim_tick: newTick, type: "conversation",
-            content: eventMemContent(agentA.name), embedding: null, importance: 0.6,
-            last_accessed: now2, access_count: 0 },
-          { agent_id: agentB.id, sim_tick: newTick, type: "conversation",
-            content: eventMemContent(agentB.name), embedding: null, importance: 0.6,
-            last_accessed: now2, access_count: 0 },
-        );
-      }
     }
 
     void convoInsert;

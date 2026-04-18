@@ -19,9 +19,8 @@ import {
   callJSON,
   MODEL_LOW,
   ConversationTurnSchema, ConversationSentimentSchema, ImportanceScoresSchema,
-  ConversationCommitmentsSchema, SocialEventSchema,
+  ConversationCommitmentsSchema,
 } from "@/lib/openai";
-import { z } from "zod";
 import { AgentRow } from "@/lib/supabase";
 
 export type ConversationTurn = {
@@ -41,24 +40,6 @@ export type RelationshipSnap = {
 
 type CommitmentGoal = { description: string; steps: string[]; priority: number };
 
-export type SocialEventDraft = {
-  title: string;
-  description: string;
-  location: string;
-  scheduledDayOffset: number;
-  scheduledTimeOfDay: string;
-  organizerIsA: boolean; // which agent is hosting
-};
-
-export type UpcomingEvent = {
-  id: string;
-  title: string;
-  location: string;
-  scheduledDay: number;
-  scheduledTimeOfDay: string;
-  organizerName: string;
-};
-
 export type ConversationResult = {
   turns: ConversationTurn[];
   memoryA: string;
@@ -69,8 +50,6 @@ export type ConversationResult = {
   importance: [number, number];
   commitmentA: CommitmentGoal | null;
   commitmentB: CommitmentGoal | null;
-  // Social event planned during this conversation (null = none)
-  socialEvent: SocialEventDraft | null;
 };
 
 const MIN_TURNS = 2; // A opens + B responds at minimum
@@ -82,7 +61,6 @@ function buildSpeakerSystemPrompt(
   rel: RelationshipSnap | null,
   timeOfDay: string,
   day: number,
-  speakerEvents: UpcomingEvent[],
 ): string {
   const famDesc = !rel ? "You have never met them before."
     : rel.familiarity < 0.2 ? "You have barely met them."
@@ -97,21 +75,12 @@ function buildSpeakerSystemPrompt(
 
   const relSummary = rel?.summary ? `\nRelationship history: ${rel.summary}` : "";
 
-  const eventCtx = speakerEvents.length > 0
-    ? `\nEvents you know about (feel free to mention or invite ${other.name}):\n` +
-      speakerEvents.map((e) =>
-        `- "${e.title}" at the ${e.location}, Day ${e.scheduledDay} ${e.scheduledTimeOfDay}` +
-        (e.organizerName === speaker.name ? " (you are hosting)" : ` (organised by ${e.organizerName})`),
-      ).join("\n")
-    : "";
-
   return `You are ${speaker.name}, a character in a fantasy village simulation.
 Backstory: ${speaker.backstory}
 Personality traits: ${speaker.traits.join(", ")}.
 You are talking with ${other.name}. ${famDesc}${sentDesc}${relSummary}
-It is currently ${timeOfDay} on Day ${day}.${eventCtx}
-Ground all dialogue in your current situation and memories only. Do not mention places you have not visited, events not in your memories, or an incorrect time of day.
-If you know about upcoming events, it is natural to bring them up or invite ${other.name}.
+It is currently ${timeOfDay} on Day ${day}.
+Ground all dialogue in your current situation and memories only. Do not mention places you have not visited or an incorrect time of day.
 Keep each line natural and brief (1–3 sentences). Match the conversational energy — if the other person is wrapping up, wrap up too.
 Always respond with valid JSON.`;
 }
@@ -126,8 +95,6 @@ export async function runConversation(
   location: string,
   timeOfDay: string,
   day: number,
-  upcomingEventsA: UpcomingEvent[],
-  upcomingEventsB: UpcomingEvent[],
 ): Promise<ConversationResult> {
   const turns: ConversationTurn[] = [];
 
@@ -149,7 +116,6 @@ export async function runConversation(
     const rel      = isA ? relAtoB : relBtoA;
     const memCtx   = isA ? memCtxA : memCtxB;
 
-    const speakerEvents = isA ? upcomingEventsA : upcomingEventsB;
     let userPrompt: string;
 
     if (t === 0) {
@@ -174,7 +140,7 @@ Respond with JSON: { "dialogue_line": "...", "internal_thought": "...", "end_con
 
     const turn = await callJSON({
       model: MODEL_LOW,
-      system: buildSpeakerSystemPrompt(speaker, other, rel, timeOfDay, day, speakerEvents),
+      system: buildSpeakerSystemPrompt(speaker, other, rel, timeOfDay, day),
       user: userPrompt,
       schema: ConversationTurnSchema,
       temperature: 0.85,
@@ -251,36 +217,6 @@ Respond with JSON: { "agentA_goal": { "description": "...", "steps": ["..."], "p
     commitmentB = commitments.agentB_goal ?? null;
   } catch { /* non-fatal */ }
 
-  // ── Social event extraction ──────────────────────────────────────────────
-  // Did the agents plan a gathering that others could attend?
-  let socialEvent: SocialEventDraft | null = null;
-  try {
-    const NullableEventSchema = z.object({
-      event: SocialEventSchema.nullable(),
-      organizer: z.enum(["agentA", "agentB", "neither"]),
-    });
-    const extracted = await callJSON({
-      model: MODEL_LOW,
-      system: `Analyse this conversation for a social event — a gathering, party, meetup, or celebration with a specific time and place that others could attend.
-Only extract if the conversation contains a clear event plan (e.g. "birthday party at the inn on Day 5 evening", "morning meetup at the plaza tomorrow").
-Casual suggestions without commitment ("we should hang out sometime") do NOT count.
-Return event: null if no concrete event was planned.
-Respond with JSON: { "event": { "title": "...", "description": "...", "location": "inn|library|bakery|workshop|apothecary|plaza|park", "scheduled_day_offset": 0-7, "scheduled_time_of_day": "morning|midday|afternoon|evening" } | null, "organizer": "agentA"|"agentB"|"neither" }`,
-      user: `${agentA.name} (agentA) and ${agentB.name} (agentB) on Day ${day} (${timeOfDay}):\n${transcript}`,
-      schema: NullableEventSchema,
-      temperature: 0.2,
-      maxTokens: 200,
-    });
-    if (extracted.event && extracted.organizer !== "neither") {
-      socialEvent = {
-        ...extracted.event,
-        scheduledDayOffset: extracted.event.scheduled_day_offset,
-        scheduledTimeOfDay: extracted.event.scheduled_time_of_day,
-        organizerIsA: extracted.organizer === "agentA",
-      };
-    }
-  } catch { /* non-fatal */ }
-
   return {
     turns,
     memoryA: summaryA,
@@ -291,6 +227,5 @@ Respond with JSON: { "event": { "title": "...", "description": "...", "location"
     importance,
     commitmentA,
     commitmentB,
-    socialEvent,
   };
 }
