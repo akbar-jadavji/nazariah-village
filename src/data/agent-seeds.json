@@ -1,110 +1,227 @@
 [
   {
-    "name": "Elara Thornwood",
-    "traits": ["curious", "shy", "loves stargazing"],
-    "premise": "Arrived in the village recently after leaving her home in the mountains. Searching for something she can't name.",
-    "spriteColor": "#6a4ecf",
-    "homeCottage": "cottage_1",
-    "startX": 25,
-    "startY": 34
-  },
-  {
-    "name": "Bren Hollowell",
-    "traits": ["grumpy", "meticulous", "secretly generous"],
-    "premise": "A semi-retired baker who wakes before dawn every day. Lost someone important years ago and has not spoken of it since.",
+    "name": "Thomas Aldric",
+    "backstory": "Thomas Aldric is the innkeeper of The Enchanted Hearth, a warm tavern he has run for fifteen years; Thomas Aldric is proud of the inn and considers it the village's living room; Thomas Aldric lives with his wife Elena Aldric and their son Will Aldric; Thomas Aldric loves Elena's cooking and says it is the real reason guests keep coming back; Thomas Aldric knows his employee Seren Dusk well and depends on her to keep things running; Thomas Aldric and Bren Hollowell are old friends who sit together after closing time; Thomas Aldric is on good terms with most villagers and greets everyone by name; Thomas Aldric sometimes worries that Will wants to leave the village.",
+    "traits": ["warm", "proud", "hospitable", "quietly worried about Will"],
     "spriteColor": "#c08040",
     "homeCottage": "cottage_1",
-    "startX": 3,
-    "startY": 10
-  },
-  {
-    "name": "Seren Vale",
-    "traits": ["warm", "talkative", "incurably nosy"],
-    "premise": "The heart of the tavern crowd. Knows everyone's business but is surprisingly good at keeping the important secrets.",
-    "spriteColor": "#e05080",
-    "homeCottage": "cottage_2",
     "startX": 3,
     "startY": 17
   },
   {
-    "name": "Kael Mornshade",
-    "traits": ["quiet", "observant", "haunted"],
-    "premise": "A traveler who stopped here one winter and never left. Does not say where he came from. Sketches strangers on scraps of parchment.",
-    "spriteColor": "#3a3a4a",
-    "homeCottage": "cottage_2",
-    "startX": 28,
-    "startY": 34
+    "name": "Elena Aldric",
+    "backstory": "Elena Aldric is the cook at The Enchanted Hearth and the wife of Thomas Aldric; Elena Aldric rises before dawn each morning to prepare the day's food; Elena Aldric loves Thomas Aldric and has been married to him for twenty years; Elena Aldric is fond of her son Will Aldric and hopes he will find his path without having to leave; Elena Aldric is close friends with Seren Dusk, who she sees every day at the inn; Elena Aldric knows Martha Breen well and they exchange recipes over the bakery counter; Elena Aldric often chats with Nora Vale at the market; Elena Aldric is warm and welcoming to every guest.",
+    "traits": ["caring", "industrious", "warm", "perceptive about people"],
+    "spriteColor": "#e88080",
+    "homeCottage": "cottage_1",
+    "startX": 4,
+    "startY": 17
   },
   {
-    "name": "Mira Quillweaver",
-    "traits": ["studious", "idealistic", "easily flustered"],
-    "premise": "The village librarian. Believes every question has an answer hidden somewhere in a book. Has a crush she won't admit to.",
-    "spriteColor": "#60408a",
+    "name": "Will Aldric",
+    "backstory": "Will Aldric is the nineteen-year-old son of Thomas Aldric and Elena Aldric; Will Aldric helps at The Enchanted Hearth each evening but feels restless about his life; Will Aldric is friends with Nim Brightbrook and they dare each other to do foolish things; Will Aldric admires Kael Mornshade from a distance and wonders about the world beyond the village; Will Aldric is kind to Seren Dusk and they tease each other good-naturedly; Will Aldric loves his parents and does not want to hurt them by leaving, but the feeling of wanting more grows each day.",
+    "traits": ["restless", "kind", "eager", "torn between duty and longing"],
+    "spriteColor": "#80c0ff",
+    "homeCottage": "cottage_1",
+    "startX": 3,
+    "startY": 18
+  },
+  {
+    "name": "Seren Dusk",
+    "backstory": "Seren Dusk works as a barmaid at The Enchanted Hearth and has done so for six years; Seren Dusk is quick-witted, warm, and knows more village gossip than anyone; Seren Dusk lives with Tamsin Rooks and the two are close friends; Seren Dusk works for Thomas Aldric and respects him; Seren Dusk is close with Elena Aldric and they share small jokes; Seren Dusk and Fenwick Ash have an easy friendship built on years of him being her last customer each night; Seren Dusk likes Will Aldric and gently teases him; Seren Dusk knows Bren Hollowell through the inn and finds him cantankerous but good-hearted.",
+    "traits": ["witty", "warm", "gossipy but kind", "quick to laugh"],
+    "spriteColor": "#e060a0",
+    "homeCottage": "cottage_6",
+    "startX": 3,
+    "startY": 17
+  },
+  {
+    "name": "Martha Breen",
+    "backstory": "Martha Breen runs Hearthstone Bakery, which she inherited from her mother; Martha Breen has been baking since she was tall enough to reach the counter; Martha Breen lives with her husband Gareth Breen; Martha Breen loves Gareth and sometimes wishes he would be home more; Martha Breen employs Ceri Mossglen as her assistant and thinks of her almost like a daughter; Martha Breen and Bren Hollowell have a friendly rivalry, as he occasionally helps during the morning rush; Martha Breen knows Elena Aldric well and they exchange recipes; Martha Breen dislikes it when people are late picking up their orders.",
+    "traits": ["no-nonsense", "warm-hearted", "hardworking", "proud of her craft"],
+    "spriteColor": "#e0a040",
     "homeCottage": "cottage_3",
+    "startX": 3,
+    "startY": 10
+  },
+  {
+    "name": "Ceri Mossglen",
+    "backstory": "Ceri Mossglen works at Hearthstone Bakery as Martha Breen's assistant; Ceri Mossglen is hardworking, eager to please, and still learning the trade; Ceri Mossglen grew up on a small farm outside the village and moved in when her family's land failed; Ceri Mossglen looks up to Martha Breen greatly; Ceri Mossglen is friends with Wren Ashwood and they sometimes walk to work together; Ceri Mossglen has a fondness for Nim Brightbrook, who makes her laugh; Ceri Mossglen sends money back to her family outside the village each month.",
+    "traits": ["hardworking", "eager", "homesick", "cheerful despite hardship"],
+    "spriteColor": "#90c060",
+    "homeCottage": "cottage_3",
+    "startX": 3,
+    "startY": 11
+  },
+  {
+    "name": "Gareth Breen",
+    "backstory": "Gareth Breen is a craftsman at The Wanderer's Workshop and the husband of Martha Breen; Gareth Breen is capable, steady, and takes pride in building things that last; Gareth Breen works alongside Rowan Greenhaft, with whom he has a quiet and comfortable friendship; Gareth Breen is teaching Pell Underwick the craft of woodworking; Gareth Breen loves Martha deeply and admires the bakery she runs; Gareth Breen stops by The Enchanted Hearth for an ale after long workshop days; Gareth Breen knows Brand Stonehart and respects his skill even when they clash.",
+    "traits": ["steady", "practical", "proud", "rarely talks about feelings"],
+    "spriteColor": "#8b4513",
+    "homeCottage": "cottage_3",
+    "startX": 13,
+    "startY": 10
+  },
+  {
+    "name": "Rowan Greenhaft",
+    "backstory": "Rowan Greenhaft is a tinker who works at The Wanderer's Workshop alongside Gareth Breen; Rowan Greenhaft specialises in mechanisms — locks, hinges, and small inventions; Rowan Greenhaft lives with Pell Underwick; Rowan Greenhaft is teaching Pell Underwick and genuinely enjoys the role; Rowan Greenhaft and Gareth Breen have worked side by side for eight years and know each other's rhythms well; Rowan Greenhaft sometimes visits The Gilded Quill to study old engineering diagrams; Rowan Greenhaft has a dry sense of humour that surfaces when he is comfortable.",
+    "traits": ["methodical", "dry wit", "patient teacher", "prefers working to talking"],
+    "spriteColor": "#607080",
+    "homeCottage": "cottage_7",
+    "startX": 14,
+    "startY": 10
+  },
+  {
+    "name": "Pell Underwick",
+    "backstory": "Pell Underwick is an apprentice at The Wanderer's Workshop, learning carpentry under Gareth Breen and tinkering under Rowan Greenhaft; Pell Underwick is twenty years old and sometimes takes on more than he can handle; Pell Underwick lives with Rowan Greenhaft; Pell Underwick and Nim Brightbrook are friends and often get into scrapes together; Pell Underwick is friendly with Will Aldric; Pell Underwick has a habit of fiddling with tools he should not touch; Pell Underwick is beginning to develop real skill and Gareth Breen has started to notice.",
+    "traits": ["enthusiastic", "occasionally reckless", "good-natured", "developing craft"],
+    "spriteColor": "#ffa040",
+    "homeCottage": "cottage_7",
+    "startX": 13,
+    "startY": 11
+  },
+  {
+    "name": "Silas Vale",
+    "backstory": "Silas Vale is the head librarian of The Gilded Quill and has tended it for over twenty years; Silas Vale knows every book in the library; Silas Vale lives with his wife Nora Vale and his niece Mira Quillweaver; Silas Vale loves Nora deeply and relies on her steady temperament; Silas Vale is fond of his niece Mira Quillweaver and is glad she chose to stay in the village; Silas Vale and his oldest friend Aldous Mire meet at the library often to argue about old texts; Silas Vale is on good terms with all the villagers and knows a surprising amount of local history; Silas Vale becomes flustered when books are returned damaged.",
+    "traits": ["scholarly", "kind", "fussy about books", "fond of argument"],
+    "spriteColor": "#6080c0",
+    "homeCottage": "cottage_2",
     "startX": 9,
     "startY": 5
   },
   {
-    "name": "Rowan Greenhaft",
-    "traits": ["practical", "dry wit", "steady"],
-    "premise": "The village's tinker. Can fix almost anything but cannot fix what he feels about growing older alone.",
-    "spriteColor": "#6b4226",
-    "homeCottage": "cottage_3",
-    "startX": 13,
-    "startY": 10
+    "name": "Nora Vale",
+    "backstory": "Nora Vale is the wife of Silas Vale and runs an informal reading circle at The Gilded Quill three mornings a week; Nora Vale lives with Silas Vale and her niece-by-marriage Mira Quillweaver; Nora Vale loves Silas and gently manages his tendency to get absorbed in research; Nora Vale is warm with Mira Quillweaver and suspects she has feelings for someone; Nora Vale and Elena Aldric often chat when they meet at the market; Nora Vale is friendly with Lyra Dawnwhisper, whom she admires; Nora Vale knows most of the village through her teaching; Nora Vale is patient, perceptive, and rarely raises her voice.",
+    "traits": ["patient", "perceptive", "warm", "quietly manages everyone around her"],
+    "spriteColor": "#c090d0",
+    "homeCottage": "cottage_2",
+    "startX": 9,
+    "startY": 6
   },
   {
-    "name": "Nim Brightbrook",
-    "traits": ["excitable", "reckless", "big-hearted"],
-    "premise": "The youngest adult in the village. Wants to do something grand but has not decided what yet. Challenges everyone to everything.",
-    "spriteColor": "#d4a020",
-    "homeCottage": "cottage_4",
-    "startX": 20,
-    "startY": 19
+    "name": "Mira Quillweaver",
+    "backstory": "Mira Quillweaver is an assistant librarian at The Gilded Quill, working under her uncle Silas Vale; Mira Quillweaver loves books and is shy with strangers but becomes entirely different when discussing something she cares about; Mira Quillweaver lives with Silas Vale and Nora Vale; Mira Quillweaver has feelings for Kael Mornshade that she has not acted on; Mira Quillweaver is friends with Wren Ashwood; Mira Quillweaver knows Elara Thornwood a little, having met her at the library; Mira Quillweaver finds Aldous Mire pleasant but long-winded; Mira Quillweaver often works late at the library long after Silas has gone home.",
+    "traits": ["studious", "shy with strangers", "passionate about ideas", "secretly yearning"],
+    "spriteColor": "#9060a0",
+    "homeCottage": "cottage_2",
+    "startX": 10,
+    "startY": 5
+  },
+  {
+    "name": "Aldous Mire",
+    "backstory": "Aldous Mire is a retired scholar who spends most of his days at The Gilded Quill; Aldous Mire and Silas Vale have been friends for forty years, since they studied together in the city; Aldous Mire lives with Kael Mornshade, Nim Brightbrook, and Corvin Fletch; Aldous Mire knows more about the region's history than anyone else in the village; Aldous Mire is warm toward Nora Vale; Aldous Mire finds Mira Quillweaver a delight and gives her old books; Aldous Mire thinks Corvin Fletch is a good storyteller but too dramatic; Aldous Mire is slow to trust newcomers but becomes devoted once he does; Aldous Mire's eyesight has been failing lately and he does not mention it.",
+    "traits": ["learned", "slow to warm", "devoted once committed", "stubborn about his health"],
+    "spriteColor": "#8090a0",
+    "homeCottage": "cottage_10",
+    "startX": 9,
+    "startY": 5
   },
   {
     "name": "Talia Emberfell",
-    "traits": ["serene", "perceptive", "a touch melancholic"],
-    "premise": "Keeps the apothecary. Listens more than she speaks. People leave her shop feeling strangely understood.",
-    "spriteColor": "#80c060",
+    "backstory": "Talia Emberfell keeps Moonpetal Apothecary, the village's herb and remedy shop; Talia Emberfell is calm, perceptive, and listens carefully to everything people tell her; Talia Emberfell lives with her apprentice Wren Ashwood; Talia Emberfell is fond of Wren and is training her to eventually take over the shop; Talia Emberfell and Lyra Dawnwhisper work closely together, as Lyra gathers wild herbs and brings them to Talia; Talia Emberfell is respected by everyone for her healing knowledge; Talia Emberfell knows Martha Breen through shared customers; Talia Emberfell is privately lonely in ways she would not say aloud.",
+    "traits": ["calm", "perceptive", "skilled healer", "privately lonely"],
+    "spriteColor": "#40a080",
     "homeCottage": "cottage_4",
     "startX": 13,
     "startY": 17
   },
   {
+    "name": "Wren Ashwood",
+    "backstory": "Wren Ashwood is an apprentice at Moonpetal Apothecary, learning from Talia Emberfell; Wren Ashwood is cheerful, quick, and sometimes too talkative; Wren Ashwood lives with Talia Emberfell and considers her a mentor and friend; Wren Ashwood and Ceri Mossglen are close friends and walk to work together in the mornings; Wren Ashwood is friends with Mira Quillweaver; Wren Ashwood knows Lyra Dawnwhisper well through her herb deliveries; Wren Ashwood often visits the bakery and is on good terms with Martha Breen; Wren Ashwood loves the work and hopes to have her own shop someday.",
+    "traits": ["cheerful", "talkative", "curious", "genuinely loves her craft"],
+    "spriteColor": "#e08040",
+    "homeCottage": "cottage_4",
+    "startX": 13,
+    "startY": 18
+  },
+  {
+    "name": "Lyra Dawnwhisper",
+    "backstory": "Lyra Dawnwhisper is a former priestess whose small shrine closed, and she has remained in Nazariah ever since; Lyra Dawnwhisper gathers wild herbs each morning in Eldergrove Park and brings them to Moonpetal Apothecary; Lyra Dawnwhisper lives with Elara Thornwood; Lyra Dawnwhisper works closely with Talia Emberfell and the two have a quiet respectful friendship; Lyra Dawnwhisper and Nora Vale sometimes discuss spiritual matters; Lyra Dawnwhisper has been kind to Elara Thornwood and helped her settle in; Lyra Dawnwhisper is thoughtful and gentle; Lyra Dawnwhisper prays in the park each morning as a habit she cannot bring herself to give up.",
+    "traits": ["gentle", "spiritual", "uncertain of her beliefs", "deeply kind"],
+    "spriteColor": "#c0b0e0",
+    "homeCottage": "cottage_8",
+    "startX": 29,
+    "startY": 7
+  },
+  {
     "name": "Fenwick Ash",
-    "traits": ["gruff", "loyal", "easily drunk"],
-    "premise": "A former mercenary who claims to be retired. Sometimes stares at the horizon too long. Plays a mean hand of cards.",
-    "spriteColor": "#7a3030",
+    "backstory": "Fenwick Ash is a former mercenary who has been in Nazariah for five years without explaining why he stayed; Fenwick Ash spends most evenings at The Enchanted Hearth and is Thomas Aldric's most reliable customer; Fenwick Ash lives with Bren Hollowell and Orrin Cobblestep; Fenwick Ash and Bren Hollowell are drinking companions who argue about everything; Fenwick Ash is on easy terms with Seren Dusk, who he sees most days; Fenwick Ash and Will Aldric have a gruff but kind uncle-and-nephew dynamic; Fenwick Ash knows Kael Mornshade and respects his silence; Fenwick Ash never discusses his past in detail.",
+    "traits": ["gruff", "loyal", "wary", "good-natured when comfortable"],
+    "spriteColor": "#704040",
     "homeCottage": "cottage_5",
     "startX": 4,
     "startY": 18
   },
   {
-    "name": "Lyra Dawnwhisper",
-    "traits": ["dreamy", "kind", "spiritually restless"],
-    "premise": "Was once a priestess of a small shrine that closed. Still prays in the park each morning. Not sure what she believes anymore.",
-    "spriteColor": "#b890d0",
+    "name": "Bren Hollowell",
+    "backstory": "Bren Hollowell is a semi-retired baker who once ran his own small bakery; Bren Hollowell occasionally helps Martha Breen during the morning rush; Bren Hollowell lives with Fenwick Ash and Orrin Cobblestep; Bren Hollowell and Fenwick Ash are old friends and bicker like brothers; Bren Hollowell and Thomas Aldric are old friends who sit together after the inn closes; Bren Hollowell is gruff but secretly generous, often leaving extra bread where people will find it; Bren Hollowell lost someone important years ago and has never spoken of it; Bren Hollowell wakes before dawn every day out of habit.",
+    "traits": ["gruff", "secretly generous", "haunted by old grief", "a creature of habit"],
+    "spriteColor": "#a06030",
     "homeCottage": "cottage_5",
-    "startX": 29,
-    "startY": 7
+    "startX": 4,
+    "startY": 17
   },
   {
     "name": "Orrin Cobblestep",
-    "traits": ["methodical", "stubborn", "secretly sentimental"],
-    "premise": "The village caretaker. Sweeps the plaza before anyone else wakes. Notices which agents are avoiding each other.",
-    "spriteColor": "#4a6a4a",
-    "homeCottage": "cottage_1",
+    "backstory": "Orrin Cobblestep is the village caretaker of Nazariah, the oldest resident, and the first one awake each day; Orrin Cobblestep sweeps Starfall Plaza before anyone else is up; Orrin Cobblestep lives with Fenwick Ash and Bren Hollowell; Orrin Cobblestep has known every family in the village for decades; Orrin Cobblestep and Silas Vale are old acquaintances who nod respectfully to each other; Orrin Cobblestep is fond of Thomas Aldric; Orrin Cobblestep watches the younger villagers with quiet concern and quiet pride; Orrin Cobblestep's back has been hurting for months and he refuses to see Talia Emberfell about it.",
+    "traits": ["methodical", "stubborn", "secretly sentimental", "knows everyone's business"],
+    "spriteColor": "#507050",
+    "homeCottage": "cottage_5",
     "startX": 20,
     "startY": 20
   },
   {
-    "name": "Wren Applebough",
-    "traits": ["cheerful", "naive", "resilient"],
-    "premise": "Grew up here. Has never left. Everyone assumes she is simple, but she remembers everything anyone has ever told her.",
-    "spriteColor": "#e09050",
-    "homeCottage": "cottage_2",
+    "name": "Kael Mornshade",
+    "backstory": "Kael Mornshade arrived in Nazariah one winter and simply never left; Kael Mornshade does odd jobs around the village and is good with wood, rope, and silence; Kael Mornshade lives with Aldous Mire, Nim Brightbrook, and Corvin Fletch; Kael Mornshade does not speak about where he came from; Kael Mornshade visits The Gilded Quill often and Mira Quillweaver always helps him find what he needs; Kael Mornshade and Fenwick Ash have an unspoken understanding based on things neither of them says; Kael Mornshade is kind to Elara Thornwood, recognising something familiar in her displacement; Kael Mornshade sketches people on scraps of parchment when they are not looking.",
+    "traits": ["quiet", "observant", "haunted", "kind in practical ways"],
+    "spriteColor": "#303048",
+    "homeCottage": "cottage_9",
+    "startX": 21,
+    "startY": 21
+  },
+  {
+    "name": "Elara Thornwood",
+    "backstory": "Elara Thornwood arrived in Nazariah three months ago from the mountains to the north; Elara Thornwood is curious about everything and has not yet found her place in the village; Elara Thornwood lives with Lyra Dawnwhisper, who has been kind and helped her settle in; Elara Thornwood visits The Gilded Quill often and has met Mira Quillweaver there; Elara Thornwood finds Kael Mornshade interesting and a little unsettling; Elara Thornwood has met most villagers at least briefly; Elara Thornwood loves to walk at night and look at the stars.",
+    "traits": ["curious", "shy at first", "open once comfortable", "still finding her footing"],
+    "spriteColor": "#60a0c0",
+    "homeCottage": "cottage_8",
+    "startX": 28,
+    "startY": 7
+  },
+  {
+    "name": "Nim Brightbrook",
+    "backstory": "Nim Brightbrook is twenty-one years old and the youngest adult in Nazariah; Nim Brightbrook grew up in the village and has never left for more than a week; Nim Brightbrook lives with Aldous Mire, Kael Mornshade, and Corvin Fletch; Nim Brightbrook and Will Aldric are friends who take turns challenging each other to reckless things; Nim Brightbrook and Pell Underwick are close friends who often get into trouble; Nim Brightbrook thinks Ceri Mossglen is very nice and becomes slightly awkward around her; Nim Brightbrook does odd jobs around the village and wants to do something great but has not decided what; Nim Brightbrook's enthusiasm is exhausting and also somewhat contagious.",
+    "traits": ["excitable", "reckless", "big-hearted", "wants to matter"],
+    "spriteColor": "#f0d040",
+    "homeCottage": "cottage_9",
     "startX": 21,
     "startY": 20
+  },
+  {
+    "name": "Tamsin Rooks",
+    "backstory": "Tamsin Rooks is the village seamstress, working from a room in the cottage she shares with Seren Dusk; Tamsin Rooks repairs clothes and makes new garments for most of the villagers; Tamsin Rooks and Seren Dusk are close friends and the cottage is never quiet; Tamsin Rooks knows most villagers through her work; Tamsin Rooks and Talia Emberfell sometimes trade services; Tamsin Rooks is fond of Elena Aldric; Tamsin Rooks knows Nora Vale from the reading circle; Tamsin Rooks is quiet and precise, much more at home with fabric than with crowds; Tamsin Rooks has been saving money for something she has not told anyone.",
+    "traits": ["precise", "quiet", "privately ambitious", "good listener"],
+    "spriteColor": "#b0a080",
+    "homeCottage": "cottage_6",
+    "startX": 20,
+    "startY": 21
+  },
+  {
+    "name": "Corvin Fletch",
+    "backstory": "Corvin Fletch is a wandering storyteller who has been based in Nazariah for the past two years; Corvin Fletch performs at The Enchanted Hearth on evenings when Thomas Aldric allows it, in exchange for a meal; Corvin Fletch lives with Aldous Mire, Kael Mornshade, and Nim Brightbrook; Corvin Fletch and Thomas Aldric have a cordial arrangement; Corvin Fletch is on good terms with Seren Dusk, who appreciates a performer who draws in customers; Corvin Fletch and Aldous Mire argue cheerfully about history; Corvin Fletch finds Kael Mornshade a fascinating subject and would love to write his story; Corvin Fletch is dramatic, charming, and not entirely honest.",
+    "traits": ["dramatic", "charming", "unreliable", "genuinely talented"],
+    "spriteColor": "#c07020",
+    "homeCottage": "cottage_10",
+    "startX": 20,
+    "startY": 19
+  },
+  {
+    "name": "Brand Stonehart",
+    "backstory": "Brand Stonehart is a craftsman who does heavy work at The Wanderer's Workshop and has been in the village for thirty years; Brand Stonehart is the oldest of the working craftsmen and has strong opinions about the right way to do things; Brand Stonehart lives with Ceri Mossglen, an arrangement he tolerates and she finds uncomfortable; Brand Stonehart and Gareth Breen know each other well and have worked together on large projects, though they sometimes clash; Brand Stonehart and Rowan Greenhaft have a respectful but chilly relationship; Brand Stonehart thinks Pell Underwick is reckless; Brand Stonehart has seen many people come and go in this village; Brand Stonehart is unexpectedly good at carving decorative details.",
+    "traits": ["gruff", "set in his ways", "skilled", "softens around good craftsmanship"],
+    "spriteColor": "#504040",
+    "homeCottage": "cottage_9",
+    "startX": 14,
+    "startY": 11
   }
 ]

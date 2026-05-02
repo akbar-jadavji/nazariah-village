@@ -75,13 +75,13 @@ function buildSpeakerSystemPrompt(
 
   const relSummary = rel?.summary ? `\nRelationship history: ${rel.summary}` : "";
 
-  return `You are ${speaker.name}, a character in a fantasy village simulation.
-Backstory: ${speaker.backstory}
-Personality traits: ${speaker.traits.join(", ")}.
+  return `You are ${speaker.name}, a villager in Nazariah.
+${speaker.backstory}
+Traits: ${speaker.traits.join(", ")}.
 You are talking with ${other.name}. ${famDesc}${sentDesc}${relSummary}
-It is currently ${timeOfDay} on Day ${day}.
-Ground all dialogue in your current situation and memories only. Do not mention places you have not visited or an incorrect time of day.
-Keep each line natural and brief (1–3 sentences). Match the conversational energy — if the other person is wrapping up, wrap up too.
+It is ${timeOfDay} on Day ${day}.
+
+Speak exactly like a real person talking casually to someone they know. Keep it SHORT — usually one sentence, two at most. Natural speech varies in length: sometimes a single word or short phrase is enough ("Yeah, not bad.", "You seen Nim around?", "What happened to your hand?"). Do NOT deliver speeches. Do NOT explain yourself unless asked. Ground everything in what you personally know and what is happening right now.
 Always respond with valid JSON.`;
 }
 
@@ -143,8 +143,8 @@ Respond with JSON: { "dialogue_line": "...", "internal_thought": "...", "end_con
       system: buildSpeakerSystemPrompt(speaker, other, rel, timeOfDay, day),
       user: userPrompt,
       schema: ConversationTurnSchema,
-      temperature: 0.85,
-      maxTokens: 150,
+      temperature: 0.9,
+      maxTokens: 80,
     });
 
     turns.push({

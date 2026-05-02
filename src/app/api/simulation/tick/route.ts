@@ -1,8 +1,21 @@
+/**
+ * /api/simulation/tick  — the "think" loop, AI decisions only
+ *
+ * Called every ~5 s by the client. Handles:
+ *   1. AI action decisions for idle agents (path=null, current_building=null)
+ *   2. Conversations between agents who decided to talk_to each other
+ *   3. Periodic reflections + goal formation
+ *   4. Advancing sim state (tick, day, time_of_day)
+ *
+ * Movement (path advancement) is handled separately by /api/simulation/move
+ * which runs every ~300 ms without any LLM calls.
+ */
+
 import { NextRequest, NextResponse } from "next/server";
 import { serverClient, AgentRow } from "@/lib/supabase";
 import { generateTileMap } from "@/data/tilemap";
 import { findPath } from "@/engine/pathfinding";
-import { BUILDING_ID_TO_KEY, ENTERABLE_BUILDING_IDS } from "@/engine/buildings";
+import { BUILDING_ID_TO_KEY } from "@/engine/buildings";
 import {
   callJSON, embed,
   MODEL_LOW,
@@ -15,34 +28,32 @@ import { TileMap } from "@/lib/types";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Constants
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Constants ───────────────────────────────────────────────────────────────
 
 const TICKS_PER_DAY = 96;
-const OBSERVATION_RADIUS = 6; // tiles — agents perceive others within this range
-const TALK_RADIUS = 3;         // tiles — max distance to initiate conversation
-const TALK_COOLDOWN_TICKS = 15; // min ticks before same pair can talk again
-const MEMORY_RETRIEVE_COUNT = 30; // top-N by cosine similarity before re-ranking
-const MEMORY_CONTEXT_COUNT = 10; // final top-N fed into decision prompt
-const INTERNAL_THOUGHT_CHANCE = 0.25; // probability when agent is idle
-
-// Weighted scores for memory re-ranking (must sum to ~1)
+const TALK_RADIUS = 3;
+const TALK_COOLDOWN_TICKS = 15;
+const MEMORY_RETRIEVE_COUNT = 30;
+const MEMORY_CONTEXT_COUNT = 10;
+const INTERNAL_THOUGHT_CHANCE = 0.25;
 const W_RECENCY = 0.3;
 const W_RELEVANCE = 0.3;
 const W_IMPORTANCE = 0.4;
-const RECENCY_DECAY = 0.995; // per-tick exponential decay
+const RECENCY_DECAY = 0.995;
+// 0 = agent needs a decision immediately (set by move loop when path completes)
+const NEEDS_DECISION = 0;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// All valid building keys (including new cottages)
+const ALL_BUILDING_KEYS =
+  "inn, library, bakery, workshop, apothecary, plaza, park, " +
+  "cottage_1, cottage_2, cottage_3, cottage_4, cottage_5, " +
+  "cottage_6, cottage_7, cottage_8, cottage_9, cottage_10";
 
-function rand(n: number): number {
-  return Math.floor(Math.random() * n);
-}
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function timeOfDayForTick(tick: number):
-  "morning" | "midday" | "afternoon" | "evening" | "night" {
+function rand(n: number) { return Math.floor(Math.random() * n); }
+
+function timeOfDayForTick(tick: number): "morning" | "midday" | "afternoon" | "evening" | "night" {
   const h = tick % TICKS_PER_DAY;
   if (h < 20) return "morning";
   if (h < 48) return "midday";
@@ -51,20 +62,17 @@ function timeOfDayForTick(tick: number):
   return "night";
 }
 
-/** Distance between two positions (Chebyshev, good for tile proximity). */
-function dist(ax: number, ay: number, bx: number, by: number): number {
+function dist(ax: number, ay: number, bx: number, by: number) {
   return Math.max(Math.abs(ax - bx), Math.abs(ay - by));
 }
 
-/** Human-readable location description for the prompt. */
 function describeLocation(agent: AgentRow, tilemap: TileMap): string {
   if (agent.current_building) {
     const entry = tilemap.buildingEntries.find(
       (b) => BUILDING_ID_TO_KEY[b.id] === agent.current_building,
     );
-    return entry ? `inside ${entry.name}` : `inside a building`;
+    return entry ? `inside ${entry.name}` : "inside a building";
   }
-  // Nearest named area
   let nearest: { name: string; d: number } | null = null;
   for (const b of tilemap.buildingEntries) {
     const d = dist(agent.current_x, agent.current_y, b.entryX, b.entryY);
@@ -74,7 +82,6 @@ function describeLocation(agent: AgentRow, tilemap: TileMap): string {
   return `somewhere in the village (tile ${agent.current_x},${agent.current_y})`;
 }
 
-/** Find the entry tile for a building key. */
 function buildingEntry(key: string | null, tilemap: TileMap) {
   if (!key) return null;
   for (const b of tilemap.buildingEntries) {
@@ -83,7 +90,6 @@ function buildingEntry(key: string | null, tilemap: TileMap) {
   return null;
 }
 
-/** Build the observation string an agent generates this decision cycle. */
 function buildObservation(
   agent: AgentRow,
   allAgents: AgentRow[],
@@ -94,33 +100,21 @@ function buildObservation(
 ): string {
   const location = describeLocation(agent, tilemap);
   const nearby = allAgents
-    .filter(
-      (a) =>
-        a.id !== agent.id &&
-        !a.current_building &&
-        dist(agent.current_x, agent.current_y, a.current_x, a.current_y) <=
-          OBSERVATION_RADIUS,
+    .filter((a) =>
+      a.id !== agent.id &&
+      !a.current_building &&
+      dist(agent.current_x, agent.current_y, a.current_x, a.current_y) <= 6,
     )
     .map((a) => a.name);
-
-  const nearbyStr =
-    nearby.length === 0
-      ? "Nobody is nearby."
-      : `Nearby: ${nearby.join(", ")}.`;
-
+  const nearbyStr = nearby.length === 0 ? "Nobody is nearby." : `Nearby: ${nearby.join(", ")}.`;
   return `[Day ${day}, ${timeOfDay}, tick ${tick}] I am ${location}. ${nearbyStr}`;
 }
 
 type MemoryRow = {
-  id: string;
-  sim_tick: number;
-  type: string;
-  content: string;
-  importance: number;
-  relevance: number;
+  id: string; sim_tick: number; type: string;
+  content: string; importance: number; relevance: number;
 };
 
-/** Retrieve and re-rank top memories for an agent using their observation embedding. */
 async function retrieveMemories(
   agentId: string,
   embedding: number[],
@@ -133,7 +127,6 @@ async function retrieveMemories(
     match_count: MEMORY_RETRIEVE_COUNT,
   });
   if (error || !data) return [];
-
   return (data as MemoryRow[])
     .map((m) => ({
       ...m,
@@ -142,13 +135,12 @@ async function retrieveMemories(
         W_RELEVANCE * m.relevance +
         W_IMPORTANCE * m.importance,
     }))
-    .sort((a, b) => (b as typeof b & {score:number}).score - (a as typeof a & {score:number}).score)
+    .sort((a, b) => (b as typeof b & { score: number }).score - (a as typeof a & { score: number }).score)
     .slice(0, MEMORY_CONTEXT_COUNT);
 }
 
 type GoalSnap = { description: string; steps: string[] | null; priority: number };
 
-/** Action decision (gpt-4o-mini). */
 async function decideAction(
   agent: AgentRow,
   observation: string,
@@ -157,137 +149,106 @@ async function decideAction(
   timeOfDay: string,
   day: number,
   nearbyAgents: { name: string; ticksSinceSpoke: number | null }[],
-): Promise<{ chosen_action: string; target_building: string | null; target_agent: string | null; reasoning: string }> {
-  const memoryBlock =
-    memories.length === 0
-      ? "No relevant memories yet."
-      : memories
-          .map((m, i) => `${i + 1}. [${m.type}] ${m.content}`)
-          .join("\n");
+) {
+  const memoryBlock = memories.length === 0
+    ? "No relevant memories yet."
+    : memories.map((m, i) => `${i + 1}. [${m.type}] ${m.content}`).join("\n");
 
   const goalBlock = activeGoals.length === 0
     ? "No active goals."
-    : activeGoals
-        .map((g, i) => {
-          const steps = Array.isArray(g.steps) && g.steps.length > 0
-            ? ` Steps: ${g.steps.join(" → ")}`
-            : "";
-          return `${i + 1}. [priority ${g.priority}/5] ${g.description}${steps}`;
-        })
-        .join("\n");
+    : activeGoals.map((g, i) => {
+        const steps = Array.isArray(g.steps) && g.steps.length > 0
+          ? ` Steps: ${g.steps.join(" → ")}` : "";
+        return `${i + 1}. [priority ${g.priority}/5] ${g.description}${steps}`;
+      }).join("\n");
 
   const talkOption = nearbyAgents.length > 0
-    ? `- talk_to: start a conversation with someone nearby. Set target_agent to their exact name. Nearby agents:\n${nearbyAgents.map((a) => {
-        const recency = a.ticksSinceSpoke === null ? "never spoken" : `last spoke ${a.ticksSinceSpoke} ticks ago`;
-        return `  • ${a.name} (${recency})`;
-      }).join("\n")}`
+    ? `- talk_to: start a conversation. Set target_agent to their exact name. Nearby:\n${
+        nearbyAgents.map((a) => {
+          const r = a.ticksSinceSpoke === null ? "never spoken" : `last spoke ${a.ticksSinceSpoke} ticks ago`;
+          return `  • ${a.name} (${r})`;
+        }).join("\n")}`
     : "";
-
-  const system = `You are ${agent.name}, a character in a fantasy village simulation.
-Backstory: ${agent.backstory}
-Personality traits: ${agent.traits.join(", ")}.
-Home: ${agent.home_building_id}.
-Always respond with valid JSON only.`;
 
   const user = `Current observation: ${observation}
 
-Active goals (these are your current intentions — act on them):
+Active goals (act on these):
 ${goalBlock}
 
-Recent relevant memories:
+Recent memories:
 ${memoryBlock}
 
 Available actions:
-- move_to: walk to a building. Set target_building to one of: inn, library, bakery, workshop, apothecary, plaza, park, cottage_1, cottage_2, cottage_3, cottage_4, cottage_5. Set to null to wander freely.
-- idle: stay put and reflect.
-- go_home: return to your cottage.
+- move_to: walk to a building. target_building: one of: ${ALL_BUILDING_KEYS}. Use null to wander.
+- idle: stay and do something small.
+- go_home: return to ${agent.home_building_id}.
 ${talkOption}
 
-It is ${timeOfDay} on day ${day}. Prioritise acting on your active goals. If a goal says to meet someone or go somewhere, do it. If an event is happening right now at its scheduled time, go there.
-Social note: Only choose talk_to if you have something meaningful to say, share, or ask. Avoid re-approaching someone you spoke with very recently unless you have a clear reason.
-Respond with JSON: { "chosen_action": "...", "target_building": "..." or null, "target_agent": "..." or null, "reasoning": "..." }`;
+It is ${timeOfDay} on Day ${day}. Act on your goals. Be a real person — you have a life here, routines, people you care about.
+Also write: action_description (one present-tense sentence like "${agent.name} is checking on the bread loaves") and action_emoji (1-3 emojis that represent the action, e.g. 🍞🔥).
+Respond with JSON: { "chosen_action": "...", "target_building": ... or null, "target_agent": ... or null, "reasoning": "...", "action_description": "...", "action_emoji": "..." }`;
 
   return callJSON({
     model: MODEL_LOW,
-    system,
+    system: `You are ${agent.name}, a villager in Nazariah.\n${agent.backstory}\nTraits: ${agent.traits.join(", ")}.\nAlways respond with valid JSON only.`,
     user,
     schema: ActionDecisionSchema,
-    temperature: 0.8,
-    maxTokens: 220,
+    temperature: 0.85,
+    maxTokens: 250,
   });
 }
 
-/** GPT-4o-mini internal thought for idle agents. */
 async function generateThought(agent: AgentRow, observation: string): Promise<string | null> {
   try {
     const result = await callJSON({
       model: MODEL_LOW,
-      system: `You are ${agent.name}. Personality: ${agent.traits.join(", ")}. Write a single brief internal thought (max 100 words) in first person. Respond with JSON: { "thought": "..." }`,
-      user: `Context: ${observation}\nWhat are you thinking right now?`,
+      system: `You are ${agent.name}. Traits: ${agent.traits.join(", ")}. Write a brief first-person internal thought (one sentence). Respond with JSON: { "thought": "..." }`,
+      user: `Context: ${observation}`,
       schema: InternalThoughtSchema,
       temperature: 0.9,
-      maxTokens: 80,
+      maxTokens: 60,
     });
     return result.thought;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-/** Batch importance scoring for a list of memory contents (GPT-4o-mini). */
 async function scoreImportance(contents: string[]): Promise<number[]> {
   if (contents.length === 0) return [];
   try {
     const result = await callJSON({
       model: MODEL_LOW,
-      system: `Rate the long-term significance of each memory for a village character on a scale of 0.0 to 1.0.
-0.0 = trivial routine (walking down a road).
-0.5 = notable event (meeting someone new, learning something).
-1.0 = life-changing (witnessing something extraordinary).
-Respond with JSON: { "scores": [0.0, 0.5, ...] } — one score per memory, in the same order.`,
+      system: `Rate each memory's long-term significance for a village character (0.0 trivial → 1.0 life-changing). Respond: { "scores": [float, ...] }`,
       user: contents.map((c, i) => `${i + 1}. ${c}`).join("\n"),
       schema: ImportanceScoresSchema,
       temperature: 0.3,
       maxTokens: 100,
     });
-    // Clamp and pad/trim to match length
     const scores = result.scores.map((s) => Math.max(0, Math.min(1, s)));
     while (scores.length < contents.length) scores.push(0.3);
     return scores.slice(0, contents.length);
   } catch {
-    return contents.map(() => 0.3); // fallback: treat all as mildly important
+    return contents.map(() => 0.3);
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Main handler
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Main handler ─────────────────────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
   const supabase = serverClient();
   const tilemap = generateTileMap();
 
-  // Optional player position — lets agents see and initiate chat with the player.
   const body = await req.json().catch(() => ({})) as {
-    playerX?: number;
-    playerY?: number;
-    playerName?: string;
+    playerX?: number; playerY?: number; playerName?: string;
   };
   const { playerX, playerY, playerName } = body;
 
-  // Load state + agents (full rows needed for backstory/traits in prompts)
   const [stateRes, agentsRes] = await Promise.all([
-    supabase
-      .from("simulation_state")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle(),
+    supabase.from("simulation_state").select("*")
+      .order("created_at", { ascending: false }).limit(1).maybeSingle(),
     supabase.from("agents").select("*"),
   ]);
 
   if (stateRes.error) return NextResponse.json({ error: stateRes.error.message }, { status: 500 });
-  if (agentsRes.error) return NextResponse.json({ error: agentsRes.error.message }, { status: 500 });
   if (!stateRes.data) return NextResponse.json({ error: "World not initialized" }, { status: 409 });
 
   const sim = stateRes.data;
@@ -298,57 +259,36 @@ export async function POST(req: NextRequest) {
   const newDay = sim.current_day + (newTick % TICKS_PER_DAY === 0 ? 1 : 0);
   const newTimeOfDay = timeOfDayForTick(newTick);
 
-  // ── Occupancy map ────────────────────────────────────────────────────────
-  const occupancy = new Map<string, string>(); // "x,y" → agentId
-  for (const a of agents) {
-    if (!a.current_building) occupancy.set(`${a.current_x},${a.current_y}`, a.id);
-  }
-  const keyOf = (x: number, y: number) => `${x},${y}`;
-
-  // ── Classify agents ──────────────────────────────────────────────────────
-  // Agents that need a full decision cycle (no path, not currently busy/inside)
-  const needsDecision = agents.filter((a) => {
-    if (newTick < a.next_decision_tick) return false; // still busy
-    if (a.current_building) return false; // exiting is handled separately
-    if (a.path && a.path.length > 0) return false; // still walking
-    return true;
-  });
-
-  // Agents inside a building whose wait is over → they just exit
-  const exiting = agents.filter(
-    (a) => a.current_building && newTick >= a.next_decision_tick,
+  // ── Select agents needing AI decisions ───────────────────────────────────
+  // Only idle agents: no path, not inside a building, next_decision_tick reached
+  const aiDeciders = agents.filter((a) =>
+    !a.current_building &&
+    (!a.path || a.path.length === 0) &&
+    (a.next_decision_tick <= newTick || a.next_decision_tick === NEEDS_DECISION) &&
+    newTimeOfDay !== "night",
   );
 
-  // Agents actively walking → advance one step
-  const walking = agents.filter(
-    (a) =>
-      !a.current_building &&
-      a.path &&
-      a.path.length > 0 &&
-      newTick >= a.next_decision_tick,
-  );
-
-  // ── Night override ───────────────────────────────────────────────────────
-  // At night, agents not already home skip LLM and just go home.
-  const nightGoHome = newTimeOfDay === "night"
-    ? needsDecision.filter((a) => a.current_building !== a.home_building_id)
-    : [];
-  const aiDeciders = newTimeOfDay === "night"
-    ? needsDecision.filter((a) => a.current_building === a.home_building_id)
-    : needsDecision;
-
-  // ── Phase 1: Build observations + fetch active goals ─────────────────────
-  const observations: Map<string, string> = new Map();
-  for (const agent of aiDeciders) {
-    observations.set(
-      agent.id,
-      buildObservation(agent, agents, tilemap, newTick, newTimeOfDay, newDay),
-    );
+  if (aiDeciders.length === 0) {
+    // Advance state and return quickly
+    await supabase.from("simulation_state")
+      .update({ current_tick: newTick, current_day: newDay, time_of_day: newTimeOfDay })
+      .eq("id", sim.id);
+    const { data: freshAgents } = await supabase.from("agents")
+      .select("id, name, sprite_key, current_x, current_y, current_building, status, is_sleeping, action_emoji, action_description")
+      .order("name");
+    return NextResponse.json({
+      state: { ...sim, current_tick: newTick, current_day: newDay, time_of_day: newTimeOfDay },
+      agents: freshAgents ?? [], conversations: [], agentChatRequests: [],
+    });
   }
 
-  // Fetch active goals for all decision-making agents in one query
-  const { data: goalsData } = await supabase
-    .from("goals")
+  // ── Phase 1: Observations + goals ────────────────────────────────────────
+  const observations = new Map<string, string>();
+  for (const a of aiDeciders) {
+    observations.set(a.id, buildObservation(a, agents, tilemap, newTick, newTimeOfDay, newDay));
+  }
+
+  const { data: goalsData } = await supabase.from("goals")
     .select("agent_id, description, steps, priority")
     .in("agent_id", aiDeciders.map((a) => a.id))
     .eq("status", "active")
@@ -361,69 +301,57 @@ export async function POST(req: NextRequest) {
     goalsByAgent.set(g.agent_id, arr);
   }
 
-  // ── Phase 2: Embed observations (parallel) ───────────────────────────────
+  // ── Phase 2: Embed observations ──────────────────────────────────────────
   const embeddingResults = await Promise.allSettled(
     aiDeciders.map((a) => embed(observations.get(a.id)!)),
   );
 
-  // ── Phase 3: Retrieve memories + batch importance (parallel) ─────────────
-  const [memoryResults] = await Promise.all([
-    Promise.allSettled(
-      aiDeciders.map((a, i) => {
-        const embResult = embeddingResults[i];
-        if (embResult.status !== "fulfilled") return Promise.resolve([] as MemoryRow[]);
-        return retrieveMemories(a.id, embResult.value, newTick, supabase);
-      }),
-    ),
-  ]);
+  // ── Phase 3: Retrieve memories ────────────────────────────────────────────
+  const memoryResults = await Promise.allSettled(
+    aiDeciders.map((a, i) => {
+      const emb = embeddingResults[i];
+      if (emb.status !== "fulfilled") return Promise.resolve([] as MemoryRow[]);
+      return retrieveMemories(a.id, (emb as PromiseFulfilledResult<number[]>).value, newTick, supabase);
+    }),
+  );
 
-  // ── Phase 4: Action decisions (parallel, allSettled) ─────────────────────
-  // Build per-agent list of talkable nearby agents with recency context.
-  // Fetch last_interaction_tick from relationships for all pairs in one query.
-  const allRelRes = await supabase
-    .from("relationships")
+  // ── Phase 4: Build nearby-talkable lists ─────────────────────────────────
+  const { data: relData } = await supabase.from("relationships")
     .select("agent_id, target_id, last_interaction_tick")
     .in("agent_id", aiDeciders.map((a) => a.id));
-  const relRecency = new Map<string, number>(); // "agentId:targetId" → tick
-  for (const r of allRelRes.data ?? []) {
+  const relRecency = new Map<string, number>();
+  for (const r of relData ?? []) {
     if (r.last_interaction_tick) relRecency.set(`${r.agent_id}:${r.target_id}`, r.last_interaction_tick);
   }
 
-  type NearbyAgent = { name: string; ticksSinceSpoke: number | null };
-  const nearbyTalkable = new Map<string, NearbyAgent[]>();
+  const nearbyTalkable = new Map<string, { name: string; ticksSinceSpoke: number | null }[]>();
   for (const agent of aiDeciders) {
-    if (agent.current_building) continue;
-    const nearby: NearbyAgent[] = agents
-      .filter(
-        (a) =>
-          a.id !== agent.id &&
-          !a.current_building &&
-          dist(agent.current_x, agent.current_y, a.current_x, a.current_y) <= TALK_RADIUS,
+    const nearby = agents
+      .filter((a) =>
+        a.id !== agent.id &&
+        !a.current_building &&
+        dist(agent.current_x, agent.current_y, a.current_x, a.current_y) <= TALK_RADIUS,
       )
       .map((a) => {
         const lastTick = relRecency.get(`${agent.id}:${a.id}`) ?? null;
         return { name: a.name, ticksSinceSpoke: lastTick !== null ? newTick - lastTick : null };
       });
-    // Add player as a potential conversation partner if they're nearby
     if (playerX !== undefined && playerY !== undefined && playerName) {
       if (dist(agent.current_x, agent.current_y, playerX, playerY) <= TALK_RADIUS) {
-        const playerLastTick = relRecency.get(`${agent.id}:player`) ?? null;
-        nearby.push({
-          name: playerName,
-          ticksSinceSpoke: playerLastTick !== null ? newTick - playerLastTick : null,
-        });
+        const playerLast = relRecency.get(`${agent.id}:player`) ?? null;
+        nearby.push({ name: playerName, ticksSinceSpoke: playerLast !== null ? newTick - playerLast : null });
       }
     }
-
     nearbyTalkable.set(agent.id, nearby);
   }
 
+  // ── Phase 5: AI decisions ─────────────────────────────────────────────────
   const decisionResults = await Promise.allSettled(
     aiDeciders.map((a, i) =>
       decideAction(
         a,
         observations.get(a.id)!,
-        memoryResults[i].status === "fulfilled" ? memoryResults[i].value : [],
+        memoryResults[i].status === "fulfilled" ? (memoryResults[i] as PromiseFulfilledResult<MemoryRow[]>).value : [],
         goalsByAgent.get(a.id) ?? [],
         newTimeOfDay,
         newDay,
@@ -432,8 +360,8 @@ export async function POST(req: NextRequest) {
     ),
   );
 
-  // ── Phase 5: Internal thoughts for idle agents ────────────────────────────
-  const idleAgents = aiDeciders.filter((a, i) => {
+  // ── Phase 6: Internal thoughts for idle stays ─────────────────────────────
+  const idleAgents = aiDeciders.filter((_, i) => {
     const dr = decisionResults[i];
     return dr.status === "fulfilled" && dr.value.chosen_action === "idle";
   });
@@ -445,199 +373,77 @@ export async function POST(req: NextRequest) {
     ),
   );
 
-  // ── Phase 6: Importance scoring ───────────────────────────────────────────
-  const allObservationContents = aiDeciders.map((a) => observations.get(a.id)!);
-  const importanceScores = await scoreImportance(allObservationContents);
+  // ── Phase 7: Importance scoring ───────────────────────────────────────────
+  const importanceScores = await scoreImportance(aiDeciders.map((a) => observations.get(a.id)!));
 
-  // ── Collect new memories to store ────────────────────────────────────────
+  // ── Collect new memories ──────────────────────────────────────────────────
   type NewMemory = {
-    agent_id: string;
-    sim_tick: number;
-    type: string;
-    content: string;
-    embedding: number[] | null;
-    importance: number;
-    last_accessed: string;
-    access_count: number;
+    agent_id: string; sim_tick: number; type: string; content: string;
+    embedding: number[] | null; importance: number; last_accessed: string; access_count: number;
   };
   const newMemories: NewMemory[] = [];
   const now = new Date().toISOString();
 
   for (let i = 0; i < aiDeciders.length; i++) {
-    const agent = aiDeciders[i];
-    const content = observations.get(agent.id)!;
-    const embedding = embeddingResults[i].status === "fulfilled"
-      ? (embeddingResults[i] as PromiseFulfilledResult<number[]>).value
-      : null;
     newMemories.push({
-      agent_id: agent.id,
+      agent_id: aiDeciders[i].id,
       sim_tick: newTick,
       type: "observation",
-      content,
-      embedding,
+      content: observations.get(aiDeciders[i].id)!,
+      embedding: embeddingResults[i].status === "fulfilled"
+        ? (embeddingResults[i] as PromiseFulfilledResult<number[]>).value : null,
       importance: importanceScores[i] ?? 0.3,
-      last_accessed: now,
-      access_count: 0,
+      last_accessed: now, access_count: 0,
     });
   }
-
-  // Thoughts
   for (let i = 0; i < idleAgents.length; i++) {
     const tr = thoughtResults[i];
     if (tr.status === "fulfilled" && tr.value) {
-      // Thoughts are stored without embedding for now (low priority)
       newMemories.push({
-        agent_id: idleAgents[i].id,
-        sim_tick: newTick,
-        type: "internal_thought",
-        content: tr.value,
-        embedding: null,
-        importance: 0.3,
-        last_accessed: now,
-        access_count: 0,
+        agent_id: idleAgents[i].id, sim_tick: newTick, type: "internal_thought",
+        content: tr.value, embedding: null, importance: 0.3,
+        last_accessed: now, access_count: 0,
       });
     }
   }
 
-  // ── Build agent updates ───────────────────────────────────────────────────
-  type AgentUpdate = {
-    id: string;
-    current_x?: number;
-    current_y?: number;
-    current_building?: string | null;
-    path?: { x: number; y: number }[] | null;
-    next_decision_tick?: number;
-    status?: string;
-  };
+  // ── Apply action decisions to agent rows ──────────────────────────────────
+  type AgentUpdate = { id: string; [key: string]: unknown };
   const updates: AgentUpdate[] = [];
 
-  // 1. Exiting agents
-  for (const agent of exiting) {
-    updates.push({
-      id: agent.id,
-      current_building: null,
-      path: null,
-      next_decision_tick: newTick + 1 + rand(3),
-      status: "idle",
-    });
-  }
-
-  // Pre-compute which tiles walking agents will vacate this tick.
-  // This resolves swap-deadlocks: if A is at tile X and B wants X, A will
-  // vacate X → allow B to claim it (first-come in iteration order).
-  const willVacate = new Set<string>(walking.map((a) => keyOf(a.current_x, a.current_y)));
-  const claimedTiles = new Set<string>(); // prevents two agents claiming the same vacated tile
-
-  // 2. Walking agents — advance one step
-  for (const agent of walking) {
-    const nextStep = agent.path![0];
-    const nextKey = keyOf(nextStep.x, nextStep.y);
-    const holder = occupancy.get(nextKey);
-
-    if (holder && holder !== agent.id) {
-      if (willVacate.has(nextKey) && !claimedTiles.has(nextKey)) {
-        // Holder will vacate — allow this move (swap resolution).
-      } else {
-        // Truly blocked by a stationary agent or lost race for vacated tile.
-        // Clear path so the agent re-plans next tick rather than staying stuck.
-        updates.push({ id: agent.id, path: null, next_decision_tick: newTick + 1 + rand(2), status: "idle" });
-        continue;
-      }
-    }
-
-    claimedTiles.add(nextKey);
-    occupancy.delete(keyOf(agent.current_x, agent.current_y));
-    occupancy.set(nextKey, agent.id);
-    const remaining = agent.path!.slice(1);
-
-    if (remaining.length === 0) {
-      // Arrived at destination
-      const entry = tilemap.buildingEntries.find(
-        (b) => b.entryX === nextStep.x && b.entryY === nextStep.y && ENTERABLE_BUILDING_IDS.has(b.id),
-      );
-      if (entry && Math.random() < 0.5) {
-        occupancy.delete(nextKey);
-        updates.push({
-          id: agent.id,
-          current_x: nextStep.x,
-          current_y: nextStep.y,
-          current_building: BUILDING_ID_TO_KEY[entry.id] ?? String(entry.id),
-          path: null,
-          next_decision_tick: newTick + 4 + rand(8),
-          status: "resting",
-        });
-        continue;
-      }
-      updates.push({
-        id: agent.id,
-        current_x: nextStep.x,
-        current_y: nextStep.y,
-        path: null,
-        next_decision_tick: newTick + 1 + rand(2),
-        status: "idle",
-      });
-    } else {
-      updates.push({
-        id: agent.id,
-        current_x: nextStep.x,
-        current_y: nextStep.y,
-        path: remaining,
-        status: "walking",
-      });
-    }
-  }
-
-  // 3. Night go-home overrides (no LLM)
-  for (const agent of nightGoHome) {
-    const homeEntry = buildingEntry(agent.home_building_id, tilemap);
-    if (!homeEntry) continue;
-    const path = findPath(
-      { x: agent.current_x, y: agent.current_y },
-      { x: homeEntry.entryX, y: homeEntry.entryY },
-      tilemap.width, tilemap.height,
-      (x, y) => tilemap.collision[y][x] === 1,
-    );
-    if (path) {
-      updates.push({ id: agent.id, path, status: "walking" });
-    }
-  }
-
-  // 4. AI-decided actions
   for (let i = 0; i < aiDeciders.length; i++) {
     const agent = aiDeciders[i];
     const dr = decisionResults[i];
 
     // Fallback: random wander if LLM failed
     if (dr.status === "rejected") {
-      let planned: { x: number; y: number }[] | null = null;
-      for (let attempt = 0; attempt < 6 && !planned; attempt++) {
-        const tx = 1 + rand(tilemap.width - 2);
-        const ty = 1 + rand(tilemap.height - 2);
-        if (tilemap.collision[ty][tx] === 1) continue;
-        planned = findPath(
-          { x: agent.current_x, y: agent.current_y },
-          { x: tx, y: ty },
-          tilemap.width, tilemap.height,
-          (x, y) => tilemap.collision[y][x] === 1,
-        );
-      }
-      if (planned) updates.push({ id: agent.id, path: planned, status: "walking" });
+      const randEntry = tilemap.buildingEntries[rand(tilemap.buildingEntries.length)];
+      const path = findPath(
+        { x: agent.current_x, y: agent.current_y },
+        { x: randEntry.entryX, y: randEntry.entryY },
+        tilemap.width, tilemap.height,
+        (x, y) => tilemap.collision[y][x] === 1,
+      );
+      if (path) updates.push({ id: agent.id, path, status: "walking" });
       continue;
     }
 
-    const decision = dr.value;
+    const d = dr.value;
+    const emoji = d.action_emoji || "";
+    const desc = d.action_description || "";
 
-    if (decision.chosen_action === "idle") {
+    if (d.chosen_action === "idle") {
       updates.push({
-        id: agent.id,
-        path: null,
+        id: agent.id, path: null,
         next_decision_tick: newTick + 3 + rand(4),
         status: "thinking",
+        action_description: desc,
+        action_emoji: emoji,
       });
       continue;
     }
 
-    if (decision.chosen_action === "go_home") {
+    if (d.chosen_action === "go_home") {
       const homeEntry = buildingEntry(agent.home_building_id, tilemap);
       if (homeEntry) {
         const path = findPath(
@@ -646,26 +452,19 @@ export async function POST(req: NextRequest) {
           tilemap.width, tilemap.height,
           (x, y) => tilemap.collision[y][x] === 1,
         );
-        if (path) updates.push({ id: agent.id, path, status: "walking" });
+        if (path) updates.push({ id: agent.id, path, status: "walking", action_description: desc, action_emoji: emoji });
       }
       continue;
     }
 
-    // talk_to — handled in conversation pipeline below; mark as "talking" for now
-    if (decision.chosen_action === "talk_to") {
-      // Will be resolved in conversation pipeline. Hold the agent in place.
-      updates.push({
-        id: agent.id,
-        path: null,
-        next_decision_tick: newTick + 1,
-        status: "talking",
-      });
+    if (d.chosen_action === "talk_to") {
+      // Handled below in conversation pipeline
+      updates.push({ id: agent.id, path: null, next_decision_tick: newTick + 1, status: "talking", action_emoji: "💬", action_description: desc });
       continue;
     }
 
-    // move_to
-    if (decision.chosen_action === "move_to") {
-      const target = buildingEntry(decision.target_building ?? null, tilemap);
+    if (d.chosen_action === "move_to") {
+      const target = buildingEntry(d.target_building ?? null, tilemap);
       if (target) {
         const path = findPath(
           { x: agent.current_x, y: agent.current_y },
@@ -674,30 +473,16 @@ export async function POST(req: NextRequest) {
           (x, y) => tilemap.collision[y][x] === 1,
         );
         if (path) {
-          updates.push({ id: agent.id, path, status: "walking" });
+          updates.push({ id: agent.id, path, status: "walking", action_description: desc, action_emoji: emoji });
           continue;
         }
       }
-      // No valid building target or path failed — random wander fallback
-      let planned: { x: number; y: number }[] | null = null;
-      for (let attempt = 0; attempt < 6 && !planned; attempt++) {
-        const tx = 1 + rand(tilemap.width - 2);
-        const ty = 1 + rand(tilemap.height - 2);
-        if (tilemap.collision[ty][tx] === 1) continue;
-        planned = findPath(
-          { x: agent.current_x, y: agent.current_y },
-          { x: tx, y: ty },
-          tilemap.width, tilemap.height,
-          (x, y) => tilemap.collision[y][x] === 1,
-        );
-      }
-      if (planned) updates.push({ id: agent.id, path: planned, status: "walking" });
+      // No valid target — idle briefly
+      updates.push({ id: agent.id, path: null, next_decision_tick: newTick + 2 + rand(3), status: "idle", action_description: desc, action_emoji: emoji });
     }
   }
 
-  // ── Conversation pipeline ────────────────────────────────────────────────
-  // Match agents who decided to talk_to someone valid and nearby.
-  const agentById = new Map(agents.map((a) => [a.id, a]));
+  // ── Conversation pipeline ─────────────────────────────────────────────────
   const agentByName = new Map(agents.map((a) => [a.name, a]));
   const inConversation = new Set<string>();
 
@@ -712,8 +497,7 @@ export async function POST(req: NextRequest) {
   for (let i = 0; i < aiDeciders.length; i++) {
     const agent = aiDeciders[i];
     const dr = decisionResults[i];
-    if (dr.status !== "fulfilled") continue;
-    if (dr.value.chosen_action !== "talk_to") continue;
+    if (dr.status !== "fulfilled" || dr.value.chosen_action !== "talk_to") continue;
     if (inConversation.has(agent.id)) continue;
 
     const targetName = dr.value.target_agent;
@@ -723,25 +507,17 @@ export async function POST(req: NextRequest) {
     if (target.current_building) continue;
     if (dist(agent.current_x, agent.current_y, target.current_x, target.current_y) > TALK_RADIUS) continue;
 
-    // Fetch relationships
     const [relAB, relBA] = await Promise.all([
-      supabase.from("relationships").select("*")
-        .eq("agent_id", agent.id).eq("target_id", target.id).maybeSingle(),
-      supabase.from("relationships").select("*")
-        .eq("agent_id", target.id).eq("target_id", agent.id).maybeSingle(),
+      supabase.from("relationships").select("*").eq("agent_id", agent.id).eq("target_id", target.id).maybeSingle(),
+      supabase.from("relationships").select("*").eq("agent_id", target.id).eq("target_id", agent.id).maybeSingle(),
     ]);
-
-    // Fetch last 3 conversation memories for each agent mentioning the other
     const [memARes, memBRes] = await Promise.all([
-      supabase.from("memories").select("content")
-        .eq("agent_id", agent.id).eq("type", "conversation")
+      supabase.from("memories").select("content").eq("agent_id", agent.id).eq("type", "conversation")
         .order("sim_tick", { ascending: false }).limit(3),
-      supabase.from("memories").select("content")
-        .eq("agent_id", target.id).eq("type", "conversation")
+      supabase.from("memories").select("content").eq("agent_id", target.id).eq("type", "conversation")
         .order("sim_tick", { ascending: false }).limit(3),
     ]);
 
-    // Cooldown: skip if they spoke within TALK_COOLDOWN_TICKS (allow 15% override for close friends)
     const lastInteraction = relAB.data?.last_interaction_tick ?? 0;
     if (lastInteraction > 0 && newTick - lastInteraction < TALK_COOLDOWN_TICKS) {
       const familiarity = relAB.data?.familiarity ?? 0;
@@ -765,14 +541,13 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  // Collect agents that want to talk to the player (handled client-side via streaming chat).
+  // Collect agents trying to talk to the player
   type AgentChatRequest = { agentId: string; agentName: string };
   const agentChatRequests: AgentChatRequest[] = [];
   for (let i = 0; i < aiDeciders.length; i++) {
     const agent = aiDeciders[i];
     const dr = decisionResults[i];
-    if (dr.status !== "fulfilled") continue;
-    if (dr.value.chosen_action !== "talk_to") continue;
+    if (dr.status !== "fulfilled" || dr.value.chosen_action !== "talk_to") continue;
     if (inConversation.has(agent.id)) continue;
     const targetName = dr.value.target_agent;
     if (playerName && targetName?.toLowerCase() === playerName.toLowerCase()) {
@@ -780,223 +555,152 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // Run all conversations in parallel (allSettled)
+  // Run all conversations in parallel
   type ConvoResult = { agentA: AgentRow; agentB: AgentRow; result: Awaited<ReturnType<typeof runConversation>> };
   const convoSettled = await Promise.allSettled(
     convoPairs.map(async (p): Promise<ConvoResult> => ({
-      agentA: p.agentA,
-      agentB: p.agentB,
+      agentA: p.agentA, agentB: p.agentB,
       result: await runConversation(p.agentA, p.agentB, p.relAtoB, p.relBtoA, p.memsA, p.memsB, p.location, newTimeOfDay, newDay),
     })),
   );
 
-  // Collect conversation outcomes for DB writes + tick response
   type ConvoTurn = { speaker: string; speakerId: string; line: string; thought: string };
   const convoSummaries: { agentAId: string; agentBId: string; agentAName: string; agentBName: string; turns: ConvoTurn[] }[] = [];
   const now2 = new Date().toISOString();
 
   for (const settled of convoSettled) {
-    if (settled.status === "rejected") {
-      console.error("Conversation failed:", settled.reason);
-      continue;
-    }
+    if (settled.status === "rejected") { console.error("Conversation failed:", settled.reason); continue; }
     const { agentA, agentB, result } = settled.value;
 
-    // Store conversation log
-    const convoInsert = await supabase.from("conversations").insert({
-      agent_a_id: agentA.id, agent_b_id: agentB.id,
-      sim_tick: newTick, turns: result.turns,
-    }).select("id").single();
+    const convoInsert = supabase.from("conversations").insert({
+      agent_a_id: agentA.id, agent_b_id: agentB.id, sim_tick: newTick, turns: result.turns,
+    });
 
     convoSummaries.push({
       agentAId: agentA.id, agentBId: agentB.id,
-      agentAName: agentA.name, agentBName: agentB.name,
-      turns: result.turns,
+      agentAName: agentA.name, agentBName: agentB.name, turns: result.turns,
     });
 
-    // Store conversation memories for both agents
     newMemories.push(
-      { agent_id: agentA.id, sim_tick: newTick, type: "conversation",
-        content: result.memoryA, embedding: null, importance: result.importance[0],
-        last_accessed: now2, access_count: 0 },
-      { agent_id: agentB.id, sim_tick: newTick, type: "conversation",
-        content: result.memoryB, embedding: null, importance: result.importance[1],
-        last_accessed: now2, access_count: 0 },
+      { agent_id: agentA.id, sim_tick: newTick, type: "conversation", content: result.memoryA,
+        embedding: null, importance: result.importance[0], last_accessed: now2, access_count: 0 },
+      { agent_id: agentB.id, sim_tick: newTick, type: "conversation", content: result.memoryB,
+        embedding: null, importance: result.importance[1], last_accessed: now2, access_count: 0 },
     );
 
-    // Upsert relationships for both directions
     const upsertRel = async (agentId: string, targetId: string, sentDelta: number, existingRel: RelationshipSnap | null) => {
-      const newFamiliarity = Math.min(1, (existingRel?.familiarity ?? 0) + 0.05);
-      const newSentiment = Math.max(-1, Math.min(1, (existingRel?.sentiment ?? 0) + sentDelta));
       const newCount = (existingRel?.interaction_count ?? 0) + 1;
-
-      // Every 5 interactions, regenerate summary
-      let newSummary = existingRel?.summary ?? null;
-      if (newCount % 5 === 0) {
-        newSummary = result.relationshipNote;
-      }
-
       await supabase.from("relationships").upsert({
         agent_id: agentId, target_id: targetId,
-        familiarity: newFamiliarity, sentiment: newSentiment,
-        summary: newSummary, last_interaction_tick: newTick,
+        familiarity: Math.min(1, (existingRel?.familiarity ?? 0) + 0.05),
+        sentiment: Math.max(-1, Math.min(1, (existingRel?.sentiment ?? 0) + sentDelta)),
+        summary: newCount % 5 === 0 ? result.relationshipNote : (existingRel?.summary ?? null),
+        last_interaction_tick: newTick,
         interaction_count: newCount,
       }, { onConflict: "agent_id,target_id" });
     };
 
-    const pair = convoPairs.find(p => p.agentA.id === agentA.id && p.agentB.id === agentB.id);
+    const pair = convoPairs.find((p) => p.agentA.id === agentA.id && p.agentB.id === agentB.id);
     await Promise.all([
       upsertRel(agentA.id, agentB.id, result.sentimentDeltaA, pair?.relAtoB ?? null),
       upsertRel(agentB.id, agentA.id, result.sentimentDeltaB, pair?.relBtoA ?? null),
     ]);
 
-    // Persist commitment-based goals formed during this conversation
+    // Persist commitment-based goals
     const commitmentInserts = [
       result.commitmentA ? { agent_id: agentA.id, goal: result.commitmentA } : null,
       result.commitmentB ? { agent_id: agentB.id, goal: result.commitmentB } : null,
-    ].filter(Boolean) as { agent_id: string; goal: typeof result.commitmentA & object }[];
-
+    ].filter(Boolean) as { agent_id: string; goal: NonNullable<typeof result.commitmentA> }[];
     if (commitmentInserts.length > 0) {
       await supabase.from("goals").insert(
         commitmentInserts.map(({ agent_id, goal }) => ({
-          agent_id,
-          description: goal.description,
-          priority: goal.priority,
-          status: "active",
-          steps: goal.steps,
-          created_at_tick: newTick,
-          completed_at_tick: null,
+          agent_id, description: goal.description, priority: goal.priority,
+          status: "active", steps: goal.steps, created_at_tick: newTick, completed_at_tick: null,
         })),
       );
     }
 
+    // After conversations, both agents become idle
+    updates.push(
+      { id: agentA.id, path: null, next_decision_tick: newTick + 2 + rand(3), status: "idle", action_emoji: "💬", action_description: `${agentA.name} just finished talking with ${agentB.name}` },
+      { id: agentB.id, path: null, next_decision_tick: newTick + 2 + rand(3), status: "idle", action_emoji: "💬", action_description: `${agentB.name} just finished talking with ${agentA.name}` },
+    );
+
     void convoInsert;
   }
-  void agentById;
 
-  // ── Persist memories ─────────────────────────────────────────────────────
+  // ── Persist memories ──────────────────────────────────────────────────────
   if (newMemories.length > 0) {
     const { error: memErr } = await supabase.from("memories").insert(newMemories);
     if (memErr) console.error("Memory insert error:", memErr.message);
   }
 
-  // ── Persist agent updates ────────────────────────────────────────────────
+  // ── Apply agent updates ───────────────────────────────────────────────────
   if (updates.length > 0) {
     const results = await Promise.all(
-      updates.map(({ id, ...rest }) =>
-        supabase.from("agents").update(rest).eq("id", id),
-      ),
+      updates.map(({ id, ...rest }) => supabase.from("agents").update(rest).eq("id", id)),
     );
     const firstErr = results.find((r) => r.error)?.error;
-    if (firstErr) {
-      return NextResponse.json(
-        { error: `Agent update failed: ${firstErr.message}` },
-        { status: 500 },
-      );
-    }
+    if (firstErr) return NextResponse.json({ error: `Agent update failed: ${firstErr.message}` }, { status: 500 });
   }
 
-  // ── Periodic reflections + goal formation ────────────────────────────
-  // Every 20 ticks, up to 2 agents synthesise recent memories into a
-  // reflection and optionally form a new goal.
+  // ── Periodic reflections + goal formation ─────────────────────────────────
   const REFLECTION_EVERY = 20;
   if (newTick % REFLECTION_EVERY === 0 && agents.length > 0) {
-    const candidates = agents
-      .filter((a) => !a.current_building)
-      .sort(() => Math.random() - 0.5)
-      .slice(0, 2);
+    const candidates = agents.filter((a) => !a.current_building).sort(() => Math.random() - 0.5).slice(0, 2);
+    await Promise.allSettled(candidates.map(async (agent) => {
+      try {
+        const { data: mems } = await supabase.from("memories").select("type, content, sim_tick")
+          .eq("agent_id", agent.id).order("sim_tick", { ascending: false }).limit(12);
+        if (!mems || mems.length < 4) return;
 
-    await Promise.allSettled(
-      candidates.map(async (agent) => {
-        try {
-          const { data: mems } = await supabase
-            .from("memories")
-            .select("type, content, sim_tick")
-            .eq("agent_id", agent.id)
-            .order("sim_tick", { ascending: false })
-            .limit(12);
+        const reflection = await callJSON({
+          model: MODEL_LOW,
+          system: `You are ${agent.name}. Traits: ${agent.traits.join(", ")}. Write 1-2 brief reflective insights from your recent experiences. Respond: { "reflections": ["...", "..."] }`,
+          user: mems.map((m) => `[${m.type}] ${m.content}`).join("\n"),
+          schema: ReflectionSchema,
+          temperature: 0.85,
+          maxTokens: 150,
+        });
 
-          if (!mems || mems.length < 4) return;
+        await supabase.from("memories").insert({
+          agent_id: agent.id, sim_tick: newTick, type: "reflection",
+          content: reflection.reflections.join(" "), embedding: null, importance: 0.7,
+          last_accessed: new Date().toISOString(), access_count: 0,
+        });
 
-          const memText = mems
-            .map((m) => `[${m.type}] ${m.content}`)
-            .join("\n");
-
-          const reflection = await callJSON({
-            model: MODEL_LOW,
-            system: `You are ${agent.name}. Traits: ${agent.traits.join(", ")}.
-Write 1-2 reflective insights based on your recent experiences.
-Respond with JSON: { "reflections": ["insight 1", "insight 2"] }`,
-            user: `Recent experiences:\n${memText}`,
-            schema: ReflectionSchema,
-            temperature: 0.85,
-            maxTokens: 200,
-          });
-
-          const reflectionText = reflection.reflections.join(" ");
-
-          await supabase.from("memories").insert({
-            agent_id: agent.id,
-            sim_tick: newTick,
-            type: "reflection",
-            content: reflectionText,
-            embedding: null,
-            importance: 0.7,
-            last_accessed: new Date().toISOString(),
-            access_count: 0,
-          });
-
-          // 35% chance to form a new goal if none currently active
-          if (Math.random() < 0.35) {
-            const { data: active } = await supabase
-              .from("goals")
-              .select("id")
-              .eq("agent_id", agent.id)
-              .eq("status", "active")
-              .limit(1);
-
-            if (!active || active.length === 0) {
-              const goal = await callJSON({
-                model: MODEL_LOW,
-                system: `You are ${agent.name}. Traits: ${agent.traits.join(", ")}.
-Based on your reflection, define one concrete personal goal you want to work toward.
-Respond with JSON: { "description": "...", "priority": 1-5, "steps": ["step1", "step2"] }`,
-                user: `Reflection: ${reflectionText}`,
-                schema: GoalSchema,
-                temperature: 0.8,
-                maxTokens: 150,
-              });
-
-              await supabase.from("goals").insert({
-                agent_id: agent.id,
-                description: goal.description,
-                priority: goal.priority,
-                status: "active",
-                steps: goal.steps,
-                created_at_tick: newTick,
-                completed_at_tick: null,
-              });
-            }
+        if (Math.random() < 0.35) {
+          const { data: active } = await supabase.from("goals").select("id")
+            .eq("agent_id", agent.id).eq("status", "active").limit(1);
+          if (!active || active.length === 0) {
+            const goal = await callJSON({
+              model: MODEL_LOW,
+              system: `You are ${agent.name}. Based on your reflection, define one concrete personal goal. Respond: { "description": "...", "priority": 1-5, "steps": ["step1", "step2"] }`,
+              user: reflection.reflections.join(" "),
+              schema: GoalSchema,
+              temperature: 0.8,
+              maxTokens: 120,
+            });
+            await supabase.from("goals").insert({
+              agent_id: agent.id, description: goal.description, priority: goal.priority,
+              status: "active", steps: goal.steps, created_at_tick: newTick, completed_at_tick: null,
+            });
           }
-        } catch {
-          // Reflection failures are non-fatal
         }
-      }),
-    );
+      } catch { /* non-fatal */ }
+    }));
   }
 
-  // ── Update simulation_state ───────────────────────────────────────────────
-  const { error: stateErr } = await supabase
-    .from("simulation_state")
+  // ── Advance simulation state ──────────────────────────────────────────────
+  const { error: stateErr } = await supabase.from("simulation_state")
     .update({ current_tick: newTick, current_day: newDay, time_of_day: newTimeOfDay })
     .eq("id", sim.id);
   if (stateErr) return NextResponse.json({ error: stateErr.message }, { status: 500 });
 
-  // ── Return fresh agent list ───────────────────────────────────────────────
-  const { data: freshAgents } = await supabase
-    .from("agents")
-    .select("id, name, sprite_key, current_x, current_y, current_building, status, is_sleeping")
-    .order("name", { ascending: true });
+  // ── Return fresh data ─────────────────────────────────────────────────────
+  const { data: freshAgents } = await supabase.from("agents")
+    .select("id, name, sprite_key, current_x, current_y, current_building, status, is_sleeping, action_emoji, action_description")
+    .order("name");
 
   return NextResponse.json({
     state: { ...sim, current_tick: newTick, current_day: newDay, time_of_day: newTimeOfDay },

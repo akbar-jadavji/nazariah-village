@@ -1,6 +1,6 @@
 // Tile size in pixels
 export const TILE_SIZE = 32;
-export const MAP_WIDTH = 40;
+export const MAP_WIDTH = 60;
 export const MAP_HEIGHT = 40;
 
 // Tile type IDs for the ground layer
@@ -34,6 +34,11 @@ export const BLDG_COTTAGE_2 = 9;
 export const BLDG_COTTAGE_3 = 10;
 export const BLDG_COTTAGE_4 = 11;
 export const BLDG_COTTAGE_5 = 12;
+export const BLDG_COTTAGE_6 = 13;
+export const BLDG_COTTAGE_7 = 14;
+export const BLDG_COTTAGE_8 = 15;
+export const BLDG_COTTAGE_9 = 16;
+export const BLDG_COTTAGE_10 = 17;
 
 export type Direction = "up" | "down" | "left" | "right";
 

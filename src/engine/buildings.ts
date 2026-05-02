@@ -2,14 +2,9 @@ import {
   BLDG_INN, BLDG_APOTHECARY, BLDG_LIBRARY, BLDG_PLAZA, BLDG_PARK,
   BLDG_BAKERY, BLDG_WORKSHOP,
   BLDG_COTTAGE_1, BLDG_COTTAGE_2, BLDG_COTTAGE_3, BLDG_COTTAGE_4, BLDG_COTTAGE_5,
+  BLDG_COTTAGE_6, BLDG_COTTAGE_7, BLDG_COTTAGE_8, BLDG_COTTAGE_9, BLDG_COTTAGE_10,
 } from "@/lib/types";
 
-/**
- * Map numeric building IDs ↔ stable string keys that agents use in the DB
- * (home_building_id, current_building). Kept in sync with agent-seeds.json.
- * Plaza and park are intentionally absent — they are open areas, not
- * enterable buildings.
- */
 export const BUILDING_ID_TO_KEY: Record<number, string> = {
   [BLDG_INN]: "inn",
   [BLDG_APOTHECARY]: "apothecary",
@@ -23,9 +18,15 @@ export const BUILDING_ID_TO_KEY: Record<number, string> = {
   [BLDG_COTTAGE_3]: "cottage_3",
   [BLDG_COTTAGE_4]: "cottage_4",
   [BLDG_COTTAGE_5]: "cottage_5",
+  [BLDG_COTTAGE_6]: "cottage_6",
+  [BLDG_COTTAGE_7]: "cottage_7",
+  [BLDG_COTTAGE_8]: "cottage_8",
+  [BLDG_COTTAGE_9]: "cottage_9",
+  [BLDG_COTTAGE_10]: "cottage_10",
 };
 
 export const ENTERABLE_BUILDING_IDS = new Set<number>([
   BLDG_INN, BLDG_APOTHECARY, BLDG_LIBRARY, BLDG_BAKERY, BLDG_WORKSHOP,
   BLDG_COTTAGE_1, BLDG_COTTAGE_2, BLDG_COTTAGE_3, BLDG_COTTAGE_4, BLDG_COTTAGE_5,
+  BLDG_COTTAGE_6, BLDG_COTTAGE_7, BLDG_COTTAGE_8, BLDG_COTTAGE_9, BLDG_COTTAGE_10,
 ]);

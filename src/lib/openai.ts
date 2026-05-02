@@ -76,15 +76,14 @@ export async function embed(text: string): Promise<number[]> {
 // -----------------------------------------------------------
 
 export const ActionDecisionSchema = z.object({
-  // Supported: "move_to" | "idle" | "go_home" | "talk_to"
   chosen_action: z.enum(["move_to", "idle", "go_home", "talk_to"]),
-  // For move_to: building key ("inn", "library", "bakery", "workshop",
-  // "apothecary", "park", "plaza", "cottage_1"…"cottage_5"), or null.
   target_building: z.string().nullish().default(null),
-  // For talk_to: exact name of the nearby agent to approach and talk to.
-  // Null for all other actions.
   target_agent: z.string().nullish().default(null),
-  reasoning: z.string().max(300),
+  reasoning: z.string().max(200),
+  // Present-tense description of what the agent is doing, e.g. "Thomas is wiping down the bar"
+  action_description: z.string().max(120).default(""),
+  // 1–3 emojis representing the action, e.g. "🍺✨"
+  action_emoji: z.string().max(8).default(""),
 });
 
 export const ConversationTurnSchema = z.object({

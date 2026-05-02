@@ -10,8 +10,8 @@ import { generateTileMap } from "@/data/tilemap";
 import { drawGroundTile, drawObject, drawBuilding, drawCharacter } from "@/engine/sprites";
 import { isPassable } from "@/engine/world";
 
-const CANVAS_PIXEL_W = MAP_WIDTH * TILE_SIZE;  // 1280
-const CANVAS_PIXEL_H = MAP_HEIGHT * TILE_SIZE; // 1280
+const CANVAS_PIXEL_W = MAP_WIDTH * TILE_SIZE;  // 60×32 = 1920
+const CANVAS_PIXEL_H = MAP_HEIGHT * TILE_SIZE; // 40×32 = 1280
 
 function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r = 4) {
   ctx.beginPath();
@@ -58,6 +58,8 @@ type AgentServer = {
   current_y: number;
   current_building: string | null;
   status?: string;
+  action_emoji?: string | null;
+  action_description?: string | null;
 };
 
 type ConvoTurn = { speaker: string; speakerId: string; line: string; thought: string };
@@ -367,14 +369,36 @@ export default function GameCanvas() {
     }
   }, []);
 
-  // Sim tick polling
+  // ── Move loop: fast, 300 ms, no AI — smooth movement ─────────────────────
   useEffect(() => {
     if (paused) return;
     if ((agentCount ?? 0) === 0) return;
-
-    lastTickCompletedAtRef.current = 0;
     let stopped = false;
-    const runTick = async () => {
+    const runMove = async () => {
+      if (stopped) return;
+      try {
+        const res = await fetch("/api/simulation/move", { method: "POST" });
+        if (!res.ok) return;
+        const data = await res.json();
+        const now = performance.now();
+        const prev = lastTickCompletedAtRef.current;
+        const elapsed = prev > 0 ? now - prev : 300;
+        lastTickCompletedAtRef.current = now;
+        mergeAgents(data.agents ?? [], now, Math.min(elapsed, 300));
+      } catch { /* non-fatal */ }
+    };
+    const id = setInterval(runMove, 300);
+    runMove();
+    return () => { stopped = true; clearInterval(id); };
+  }, [paused, agentCount, mergeAgents]);
+
+  // ── Think loop: slow, AI decisions — sequential, waits for completion ─────
+  useEffect(() => {
+    if (paused) return;
+    if ((agentCount ?? 0) === 0) return;
+    let stopped = false;
+    const THINK_INTERVAL_MS = 5000;
+    const runThink = async () => {
       if (stopped || tickingRef.current) return;
       tickingRef.current = true;
       try {
@@ -395,18 +419,12 @@ export default function GameCanvas() {
         }
         const data = await res.json();
         const now = performance.now();
-        const prev = lastTickCompletedAtRef.current;
-        const actualElapsed = prev > 0 ? now - prev : tickIntervalMsRef.current;
-        const lerpDurationMs = Math.min(actualElapsed, tickIntervalMsRef.current);
-        lastTickCompletedAtRef.current = now;
-        mergeAgents(data.agents ?? [], now, lerpDurationMs);
-        if (data.state) {
-          setSimState(data.state);
-          simStateRef.current = data.state;
-        }
+        if (data.state) { setSimState(data.state); simStateRef.current = data.state; }
+        // Merge agent data from think (has action_emoji/description)
+        mergeAgents(data.agents ?? [], now, 300);
         if (data.conversations && data.conversations.length > 0) {
           const tick = data.state?.current_tick ?? 0;
-          const BUBBLE_DURATION = 6000;
+          const BUBBLE_DURATION = 8000;
           for (const convo of data.conversations as ConvoLog[]) {
             const lastForA = [...convo.turns].reverse().find((t) => t.speakerId === convo.agentAId);
             const lastForB = [...convo.turns].reverse().find((t) => t.speakerId === convo.agentBId);
@@ -414,16 +432,12 @@ export default function GameCanvas() {
             if (lastForB) speechBubblesRef.current.push({ agentId: convo.agentBId, text: lastForB.line, expiresAt: now + BUBBLE_DURATION });
           }
           setConvoLog((prev) => {
-            const next = [
-              ...data.conversations.map((c: ConvoLog) => ({ ...c, tick })),
-              ...prev,
-            ].slice(0, 20);
+            const next = [...data.conversations.map((c: ConvoLog) => ({ ...c, tick })), ...prev].slice(0, 30);
             convoLogRef.current = next;
             return next;
           });
         }
-        // Handle agents that want to initiate chat with the player
-        if (data.agentChatRequests && data.agentChatRequests.length > 0 && !chatAgentIdRef.current) {
+        if (data.agentChatRequests?.length > 0 && !chatAgentIdRef.current) {
           setAgentChatRequests((prev) => {
             const existingIds = new Set(prev.map((r: { agentId: string }) => r.agentId));
             const fresh = (data.agentChatRequests as { agentId: string; agentName: string }[])
@@ -435,15 +449,12 @@ export default function GameCanvas() {
         setStateError(String(e).slice(0, 200));
       } finally {
         tickingRef.current = false;
+        if (!stopped) setTimeout(runThink, THINK_INTERVAL_MS);
       }
     };
-    const id = setInterval(runTick, tickIntervalMsRef.current);
-    runTick();
-    return () => {
-      stopped = true;
-      clearInterval(id);
-    };
-  }, [paused, speed, agentCount, mergeAgents]);
+    runThink();
+    return () => { stopped = true; };
+  }, [paused, agentCount, mergeAgents]);
 
   const togglePause = useCallback(async () => {
     const nextPaused = !paused;
@@ -657,21 +668,35 @@ export default function GameCanvas() {
       drawables.sort((a, b) => a.y - b.y);
       for (const d of drawables) d.draw();
 
-      // Agent name labels
-      ctx.font = "bold 9px monospace";
+      // Agent name labels + action emoji
       ctx.textAlign = "center";
       for (const agent of agentsRef.current) {
         if (agent.current_building) continue;
         const t = Math.min(1, (timestamp - agent.tickArrivedAt) / agent.lerpDurationMs);
         const vx = agent.prevX + (agent.current_x - agent.prevX) * t;
         const vy = agent.prevY + (agent.current_y - agent.prevY) * t;
-        const lx = vx * TILE_SIZE + TILE_SIZE / 2;
+        const cx = vx * TILE_SIZE + TILE_SIZE / 2;
+
+        // Emoji bubble above name
+        const emoji = agent.action_emoji;
+        if (emoji) {
+          ctx.font = "13px serif";
+          const ew = ctx.measureText(emoji).width;
+          ctx.fillStyle = "rgba(0,0,0,0.55)";
+          roundRect(ctx, cx - ew / 2 - 4, vy * TILE_SIZE - 28, ew + 8, 16, 4);
+          ctx.fill();
+          ctx.fillStyle = "#fff";
+          ctx.fillText(emoji, cx, vy * TILE_SIZE - 15);
+        }
+
+        // Name label
+        ctx.font = "bold 9px monospace";
         const ly = vy * TILE_SIZE - 2;
         const textW = ctx.measureText(agent.name).width;
         ctx.fillStyle = "rgba(0,0,0,0.7)";
-        ctx.fillRect(lx - textW / 2 - 3, ly - 9, textW + 6, 11);
+        ctx.fillRect(cx - textW / 2 - 3, ly - 9, textW + 6, 11);
         ctx.fillStyle = "#fff";
-        ctx.fillText(agent.name, lx, ly);
+        ctx.fillText(agent.name, cx, ly);
       }
 
       // Player name label
@@ -1118,7 +1143,7 @@ export default function GameCanvas() {
       </div>
 
       <p className="text-xs text-gray-500 mt-2 font-mono">
-        Chunk 7 — Player Integration · Press E near an agent to chat · Click agent to inspect
+        Nazariah · 25 villagers · Move loop 300 ms · Think loop 5 s · Press E to chat · Click agent to inspect
       </p>
 
       {/* Conversation log panel */}

@@ -30,6 +30,8 @@ export type AgentRow = {
   is_sleeping: boolean;
   path: { x: number; y: number }[] | null;
   next_decision_tick: number;
+  action_description: string | null;
+  action_emoji: string | null;
   created_at: string;
 };
 
