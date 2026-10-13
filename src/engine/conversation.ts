@@ -2,9 +2,9 @@
  * Conversation engine
  *
  * Drives a dynamic-length dialogue (2–8 turns) between two agents, then:
- *  - scores sentiment deltas and produces a relationship note (gpt-4o-mini)
+ *  - scores sentiment deltas and produces a relationship note (MODEL_LOW)
  *  - builds per-agent memory summaries
- *  - scores importance of those memories (gpt-4o-mini)
+ *  - scores importance of those memories (MODEL_LOW)
  *
  * Turn flow:
  *  - A always opens (turn 0)
@@ -61,6 +61,7 @@ function buildSpeakerSystemPrompt(
   rel: RelationshipSnap | null,
   timeOfDay: string,
   day: number,
+  location: string,
 ): string {
   const famDesc = !rel ? "You have never met them before."
     : rel.familiarity < 0.2 ? "You have barely met them."
@@ -80,6 +81,7 @@ ${speaker.backstory}
 Traits: ${speaker.traits.join(", ")}.
 You are talking with ${other.name}. ${famDesc}${sentDesc}${relSummary}
 It is ${timeOfDay} on Day ${day}.
+You are currently ${location}. Both of you are here together — DO NOT propose meeting somewhere you're already at, and DO refer to your surroundings naturally if it fits.
 
 Speak exactly like a real person talking casually to someone they know. Keep it SHORT — usually one sentence, two at most. Natural speech varies in length: sometimes a single word or short phrase is enough ("Yeah, not bad.", "You seen Nim around?", "What happened to your hand?"). Do NOT deliver speeches. Do NOT explain yourself unless asked. Ground everything in what you personally know and what is happening right now.
 Always respond with valid JSON.`;
@@ -140,11 +142,14 @@ Respond with JSON: { "dialogue_line": "...", "internal_thought": "...", "end_con
 
     const turn = await callJSON({
       model: MODEL_LOW,
-      system: buildSpeakerSystemPrompt(speaker, other, rel, timeOfDay, day),
+      system: buildSpeakerSystemPrompt(speaker, other, rel, timeOfDay, day, location),
       user: userPrompt,
       schema: ConversationTurnSchema,
       temperature: 0.9,
-      maxTokens: 80,
+      // 80 tokens was guaranteeing mid-sentence truncation (the JSON wrapper
+      // alone eats 15-20 tokens, then dialogue + internal_thought + flag).
+      // Conversations stay short by *prompt*, not by token cap.
+      maxTokens: 300,
     });
 
     turns.push({
@@ -171,7 +176,7 @@ Respond with JSON: { "sentiment_delta_a": float (-0.3 to 0.3), "sentiment_delta_
     user: `${agentA.name} and ${agentB.name} had this conversation:\n${transcript}`,
     schema: ConversationSentimentSchema,
     temperature: 0.3,
-    maxTokens: 120,
+    maxTokens: 250,
   });
 
   // ── Memory summaries ──────────────────────────────────────────────────────
@@ -211,7 +216,7 @@ Respond with JSON: { "agentA_goal": { "description": "...", "steps": ["..."], "p
       user: `${agentA.name} (agentA) and ${agentB.name} (agentB) had this conversation:\n${transcript}\n\nDid either agent make a concrete commitment or plan?`,
       schema: ConversationCommitmentsSchema,
       temperature: 0.2,
-      maxTokens: 200,
+      maxTokens: 400,
     });
     commitmentA = commitments.agentA_goal ?? null;
     commitmentB = commitments.agentB_goal ?? null;

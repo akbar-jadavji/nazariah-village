@@ -32,6 +32,15 @@ export type AgentRow = {
   next_decision_tick: number;
   action_description: string | null;
   action_emoji: string | null;
+  // Body state — drives emergent eat/sleep/rest behaviour.
+  hunger: number;
+  energy: number;
+  // Active or pending physical activity. When `current_activity_verb` is set
+  // the agent is either walking to the target (status=walking) or doing it
+  // (status=doing_activity). When the duration elapses the tick endpoint
+  // fires completion: generates a memory + applies state delta.
+  current_activity_verb: string | null;
+  current_activity_target: string | null;
   created_at: string;
 };
 

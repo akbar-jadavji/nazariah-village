@@ -16,6 +16,8 @@ import { serverClient, AgentRow } from "@/lib/supabase";
 import { generateTileMap } from "@/data/tilemap";
 import { findPath } from "@/engine/pathfinding";
 import { BUILDING_ID_TO_KEY } from "@/engine/buildings";
+import { WORLD_OBJECTS, getObject, nearestObjectForVerb, VERB_TUNING, buildStateDetail } from "@/data/world-objects";
+import type { ActivityVerb, InteractableObject } from "@/lib/types";
 import {
   callJSON, embed,
   MODEL_LOW,
@@ -66,6 +68,11 @@ function dist(ax: number, ay: number, bx: number, by: number) {
   return Math.max(Math.abs(ax - bx), Math.abs(ay - by));
 }
 
+/**
+ * Brief location for conversation context — "inside The Enchanted Hearth",
+ * "near Starfall Plaza", etc. Doesn't include room substructure (the
+ * conversation engine wants a short anchor, not a list).
+ */
 function describeLocation(agent: AgentRow, tilemap: TileMap): string {
   if (agent.current_building) {
     const entry = tilemap.buildingEntries.find(
@@ -82,12 +89,71 @@ function describeLocation(agent: AgentRow, tilemap: TileMap): string {
   return `somewhere in the village (tile ${agent.current_x},${agent.current_y})`;
 }
 
+/**
+ * Verbose location string for the action-decision observation. When the agent
+ * is inside a building with declared rooms, lists them so the LLM can picture
+ * substructure ("I'm in the inn, which has a Main Hall, Kitchen, Guest Rooms").
+ * This gives the prompt enough nested context that an agent at Starfall Plaza
+ * stops proposing to meet at Starfall Plaza.
+ */
+function describeLocationRich(agent: AgentRow, tilemap: TileMap): string {
+  const brief = describeLocation(agent, tilemap);
+  if (!agent.current_building) return brief;
+  const entry = tilemap.buildingEntries.find(
+    (b) => BUILDING_ID_TO_KEY[b.id] === agent.current_building,
+  );
+  if (!entry?.rooms || entry.rooms.length === 0) return brief;
+  const roomList = entry.rooms.map((r) => `${r.name} (${r.description})`).join("; ");
+  return `${brief} — sub-areas: ${roomList}`;
+}
+
 function buildingEntry(key: string | null, tilemap: TileMap) {
   if (!key) return null;
   for (const b of tilemap.buildingEntries) {
     if (BUILDING_ID_TO_KEY[b.id] === key) return b;
   }
   return null;
+}
+
+// ── Activity verb helpers ───────────────────────────────────────────────────
+
+const ACTIVITY_VERBS: ActivityVerb[] = ["eat", "sleep", "rest", "pray", "read", "forage", "bake"];
+
+/** A single row of object_states. */
+type ObjectStateRow = {
+  object_id: string;
+  state: string;
+  state_detail: string | null;
+  last_updated_tick: number;
+  last_actor_id: string | null;
+};
+
+function isActivityVerb(v: string): v is ActivityVerb {
+  return (ACTIVITY_VERBS as string[]).includes(v);
+}
+
+/** Per-agent state string for the prompt: "You feel hungry (75/100) and rested." */
+function bodyStateDescription(agent: AgentRow): string {
+  const h = agent.hunger ?? 40;
+  const e = agent.energy ?? 70;
+  const hungerLabel = h >= 80 ? "ravenous" : h >= 60 ? "hungry" : h >= 30 ? "comfortably fed" : "well-fed";
+  const energyLabel = e <= 20 ? "exhausted" : e <= 40 ? "tired" : e <= 70 ? "alert" : "well-rested";
+  return `You feel ${hungerLabel} (hunger ${h}/100) and ${energyLabel} (energy ${e}/100).`;
+}
+
+/** Compact, prompt-friendly list of object choices grouped by verb. */
+function buildObjectMenu(): string {
+  const byVerb: Record<string, InteractableObject[]> = {};
+  for (const o of WORLD_OBJECTS) {
+    (byVerb[o.verb] ??= []).push(o);
+  }
+  const lines: string[] = [];
+  for (const v of ACTIVITY_VERBS) {
+    const list = byVerb[v] ?? [];
+    if (list.length === 0) continue;
+    lines.push(`- ${v} → target_object one of: ${list.map((o) => `"${o.id}" (${o.name})`).join(", ")}`);
+  }
+  return lines.join("\n");
 }
 
 function buildObservation(
@@ -97,8 +163,11 @@ function buildObservation(
   tick: number,
   timeOfDay: string,
   day: number,
+  objectStates: Map<string, ObjectStateRow>,
 ): string {
-  const location = describeLocation(agent, tilemap);
+  // Verbose location for the decision prompt — includes the building's
+  // sub-areas so the LLM can imagine moving between bar/kitchen/guest rooms.
+  const location = describeLocationRich(agent, tilemap);
   const nearby = allAgents
     .filter((a) =>
       a.id !== agent.id &&
@@ -107,7 +176,25 @@ function buildObservation(
     )
     .map((a) => a.name);
   const nearbyStr = nearby.length === 0 ? "Nobody is nearby." : `Nearby: ${nearby.join(", ")}.`;
-  return `[Day ${day}, ${timeOfDay}, tick ${tick}] I am ${location}. ${nearbyStr}`;
+
+  // Smallville-style object perception. Only include objects within 6 tiles
+  // AND in an interesting state (i.e. not the default). The free-text detail
+  // is concatenated after the named state.
+  const objectsNearby: string[] = [];
+  for (const o of WORLD_OBJECTS) {
+    if (dist(agent.current_x, agent.current_y, o.x, o.y) > 6) continue;
+    const row = objectStates.get(o.id);
+    if (!row) continue;
+    const defaultState = o.states?.default;
+    if (defaultState && row.state === defaultState && !row.state_detail) continue;
+    const detail = row.state_detail ? ` — ${row.state_detail}` : "";
+    objectsNearby.push(`${o.name} (${row.state}${detail})`);
+  }
+  const objectsStr = objectsNearby.length === 0
+    ? ""
+    : ` Nearby objects of note: ${objectsNearby.join("; ")}.`;
+
+  return `[Day ${day}, ${timeOfDay}, tick ${tick}] I am ${location}. ${nearbyStr}${objectsStr}`;
 }
 
 type MemoryRow = {
@@ -139,7 +226,7 @@ async function retrieveMemories(
     .slice(0, MEMORY_CONTEXT_COUNT);
 }
 
-type GoalSnap = { description: string; steps: string[] | null; priority: number };
+type GoalSnap = { id: string; description: string; steps: string[] | null; priority: number };
 
 async function decideAction(
   agent: AgentRow,
@@ -171,6 +258,7 @@ async function decideAction(
     : "";
 
   const user = `Current observation: ${observation}
+${bodyStateDescription(agent)}
 
 Active goals (act on these):
 ${goalBlock}
@@ -184,9 +272,23 @@ Available actions:
 - go_home: return to ${agent.home_building_id}.
 ${talkOption}
 
+PHYSICAL ACTIVITY VERBS — these actually DO something. Each takes time and changes your body state. The engine walks you to the target object automatically.
+${buildObjectMenu()}
+
+How to choose: if hunger > 60 you probably want to eat. If energy < 30 you probably want to sleep (target_object = your own cottage bed id, e.g. bed_${agent.home_building_id}). Pray/read/forage/rest are mood and routine activities.
+
 It is ${timeOfDay} on Day ${day}. Act on your goals. Be a real person — you have a life here, routines, people you care about.
+
+GOAL COMPLETION POLICY (important — be GENEROUS, not cautious):
+Goals are short-term reminders, not permanent obligations. Retire them in completed_goal_indices when ANY of these are true:
+  • You have done the thing, even partially or imperfectly.
+  • You are currently doing the thing right now (the act of doing it counts).
+  • The goal no longer reflects your real intent (you've moved on, the moment passed, circumstances changed).
+  • The goal is older than today and you haven't acted on it — let it go.
+Default to retiring. A short, fresh goal list is better than a long stale one.
+
 Also write: action_description (one present-tense sentence like "${agent.name} is checking on the bread loaves") and action_emoji (1-3 emojis that represent the action, e.g. 🍞🔥).
-Respond with JSON: { "chosen_action": "...", "target_building": ... or null, "target_agent": ... or null, "reasoning": "...", "action_description": "...", "action_emoji": "..." }`;
+Respond with JSON: { "chosen_action": "...", "target_building": ... or null, "target_agent": ... or null, "target_object": "..." or null, "reasoning": "...", "action_description": "...", "action_emoji": "...", "completed_goal_indices": [int, ...] }`;
 
   return callJSON({
     model: MODEL_LOW,
@@ -206,7 +308,7 @@ async function generateThought(agent: AgentRow, observation: string): Promise<st
       user: `Context: ${observation}`,
       schema: InternalThoughtSchema,
       temperature: 0.9,
-      maxTokens: 60,
+      maxTokens: 200,
     });
     return result.thought;
   } catch { return null; }
@@ -259,11 +361,122 @@ export async function POST(req: NextRequest) {
   const newDay = sim.current_day + (newTick % TICKS_PER_DAY === 0 ? 1 : 0);
   const newTimeOfDay = timeOfDayForTick(newTick);
 
+  // ── Activity completion phase ────────────────────────────────────────────
+  // Any agent in status=doing_activity whose next_decision_tick has been
+  // reached has just finished their verb. Apply the verb's state delta,
+  // append a memory, retire matching goals, and clear the activity fields.
+  // These agents then re-enter the decision pool below as freshly-idle.
+  const activityCompleteUpdates: { id: string; [k: string]: unknown }[] = [];
+  const activityCompleteMemories: {
+    agent_id: string; sim_tick: number; type: "observation";
+    content: string; embedding: null; importance: number;
+    last_accessed: string; access_count: number;
+  }[] = [];
+  const activityCompletedGoalKeywords: { agentId: string; verb: ActivityVerb }[] = [];
+  // Object state mutations queued during this phase (one entry per object
+  // that should flip to its `afterAction` state).
+  const objectStateUpserts: {
+    object_id: string; state: string; state_detail: string | null; last_actor_id: string;
+  }[] = [];
+  for (const a of agents) {
+    if (a.status === "doing_activity" && a.current_activity_verb && a.next_decision_tick <= newTick) {
+      const verb = a.current_activity_verb as ActivityVerb;
+      const tuning = VERB_TUNING[verb];
+      const obj = getObject(a.current_activity_target ?? "");
+      const objName = obj?.name ?? "the spot";
+      const flavour = tuning?.completionFlavour(a.name, objName) ?? `${a.name} finished ${verb}.`;
+      const newHunger = Math.max(0, Math.min(100, (a.hunger ?? 40) + (tuning?.hungerDelta ?? 0)));
+      const newEnergy = Math.max(0, Math.min(100, (a.energy ?? 70) + (tuning?.energyDelta ?? 0)));
+      activityCompleteUpdates.push({
+        id: a.id,
+        status: "idle",
+        action_description: flavour,
+        action_emoji: "✨",
+        current_activity_verb: null,
+        current_activity_target: null,
+        hunger: newHunger,
+        energy: newEnergy,
+        next_decision_tick: NEEDS_DECISION, // re-decide immediately
+      });
+      activityCompleteMemories.push({
+        agent_id: a.id, sim_tick: newTick, type: "observation",
+        content: flavour, embedding: null, importance: 0.4,
+        last_accessed: new Date().toISOString(), access_count: 0,
+      });
+      activityCompletedGoalKeywords.push({ agentId: a.id, verb });
+      // Object state transition on completion (the Smallville perception layer).
+      // Each object with a `states.afterAction` gets bumped, with a free-text
+      // detail crafted from the actor + object kind.
+      if (obj?.states?.afterAction) {
+        const detail = buildStateDetail(obj.kind, obj.states.afterAction, a.name);
+        objectStateUpserts.push({
+          object_id: obj.id,
+          state: obj.states.afterAction,
+          state_detail: detail,
+          last_actor_id: a.id,
+        });
+      }
+      // Reflect into the in-memory agent row so the rest of the tick sees fresh state.
+      a.status = "idle";
+      a.current_activity_verb = null;
+      a.current_activity_target = null;
+      a.next_decision_tick = NEEDS_DECISION;
+      a.hunger = newHunger;
+      a.energy = newEnergy;
+    }
+  }
+  if (activityCompleteUpdates.length > 0) {
+    await Promise.all(activityCompleteUpdates.map(({ id, ...rest }) =>
+      supabase.from("agents").update(rest).eq("id", id),
+    ));
+    if (activityCompleteMemories.length > 0) {
+      await supabase.from("memories").insert(activityCompleteMemories);
+    }
+    // Auto-complete any active goals whose description name-drops the verb the
+    // agent just did. Loose substring match — pragmatic, no extra LLM call.
+    for (const { agentId, verb } of activityCompletedGoalKeywords) {
+      await supabase.from("goals")
+        .update({ status: "completed", completed_at_tick: newTick })
+        .eq("agent_id", agentId)
+        .eq("status", "active")
+        .ilike("description", `%${verb}%`);
+    }
+    // Object state transitions — upsert in parallel.
+    if (objectStateUpserts.length > 0) {
+      await Promise.all(objectStateUpserts.map((u) =>
+        supabase.from("object_states").upsert({
+          object_id: u.object_id,
+          state: u.state,
+          state_detail: u.state_detail,
+          last_actor_id: u.last_actor_id,
+          last_updated_tick: newTick,
+        }, { onConflict: "object_id" }),
+      ));
+    }
+  }
+
+  // ── Periodic body-state drift ────────────────────────────────────────────
+  // Hunger creeps up; energy drifts down. Single server-side UPDATE (one
+  // HTTP round-trip via the agent_state_drift RPC) — much friendlier to the
+  // Supabase connection pool than firing 25 parallel UPDATEs.
+  for (const a of agents) {
+    // Keep the in-memory rows in sync so the rest of the tick sees the new
+    // values without an extra SELECT.
+    a.hunger = Math.min(100, (a.hunger ?? 40) + 1);
+    a.energy = Math.max(0,   (a.energy ?? 70) - 1);
+  }
+  const { error: driftErr } = await supabase.rpc("agent_state_drift", {
+    hunger_inc: 1,
+    energy_dec: 1,
+  });
+  if (driftErr) console.warn("agent_state_drift rpc failed:", driftErr.message);
+
   // ── Select agents needing AI decisions ───────────────────────────────────
   // Only idle agents: no path, not inside a building, next_decision_tick reached
   const aiDeciders = agents.filter((a) =>
     !a.current_building &&
     (!a.path || a.path.length === 0) &&
+    a.status !== "doing_activity" && // still mid-activity → skip
     (a.next_decision_tick <= newTick || a.next_decision_tick === NEEDS_DECISION) &&
     newTimeOfDay !== "night",
   );
@@ -274,7 +487,7 @@ export async function POST(req: NextRequest) {
       .update({ current_tick: newTick, current_day: newDay, time_of_day: newTimeOfDay })
       .eq("id", sim.id);
     const { data: freshAgents } = await supabase.from("agents")
-      .select("id, name, sprite_key, current_x, current_y, current_building, status, is_sleeping, action_emoji, action_description")
+      .select("id, name, sprite_key, current_x, current_y, current_building, status, is_sleeping, action_emoji, action_description, hunger, energy, current_activity_verb, current_activity_target")
       .order("name");
     return NextResponse.json({
       state: { ...sim, current_tick: newTick, current_day: newDay, time_of_day: newTimeOfDay },
@@ -282,14 +495,46 @@ export async function POST(req: NextRequest) {
     });
   }
 
+  // ── World object state: fetch + decay stale ones ─────────────────────────
+  // Pulled once per tick; passed into observations so agents can perceive
+  // nearby state changes (oven "ready", etc.) without a per-agent query.
+  const objectStates = new Map<string, ObjectStateRow>();
+  {
+    const { data: stateRows } = await supabase
+      .from("object_states")
+      .select("object_id, state, state_detail, last_updated_tick, last_actor_id");
+    for (const r of (stateRows ?? []) as ObjectStateRow[]) objectStates.set(r.object_id, r);
+
+    // Decay any object whose `afterAction` state has lingered too long, back
+    // to its default. The detail is cleared so stale flavour doesn't bleed
+    // into observations.
+    const decayUpdates: { object_id: string; state: string }[] = [];
+    for (const o of WORLD_OBJECTS) {
+      if (!o.states?.afterAction || !o.states.decayTicks) continue;
+      const row = objectStates.get(o.id);
+      if (!row || row.state !== o.states.afterAction) continue;
+      if (newTick - row.last_updated_tick < o.states.decayTicks) continue;
+      const next = o.states.default;
+      decayUpdates.push({ object_id: o.id, state: next });
+      objectStates.set(o.id, { ...row, state: next, state_detail: null, last_updated_tick: newTick });
+    }
+    if (decayUpdates.length > 0) {
+      await Promise.all(decayUpdates.map((u) =>
+        supabase.from("object_states").update({
+          state: u.state, state_detail: null, last_updated_tick: newTick,
+        }).eq("object_id", u.object_id),
+      ));
+    }
+  }
+
   // ── Phase 1: Observations + goals ────────────────────────────────────────
   const observations = new Map<string, string>();
   for (const a of aiDeciders) {
-    observations.set(a.id, buildObservation(a, agents, tilemap, newTick, newTimeOfDay, newDay));
+    observations.set(a.id, buildObservation(a, agents, tilemap, newTick, newTimeOfDay, newDay, objectStates));
   }
 
   const { data: goalsData } = await supabase.from("goals")
-    .select("agent_id, description, steps, priority")
+    .select("id, agent_id, description, steps, priority")
     .in("agent_id", aiDeciders.map((a) => a.id))
     .eq("status", "active")
     .order("priority", { ascending: false });
@@ -297,7 +542,7 @@ export async function POST(req: NextRequest) {
   const goalsByAgent = new Map<string, GoalSnap[]>();
   for (const g of goalsData ?? []) {
     const arr = goalsByAgent.get(g.agent_id) ?? [];
-    arr.push({ description: g.description, steps: g.steps as string[] | null, priority: g.priority });
+    arr.push({ id: g.id, description: g.description, steps: g.steps as string[] | null, priority: g.priority });
     goalsByAgent.set(g.agent_id, arr);
   }
 
@@ -411,9 +656,24 @@ export async function POST(req: NextRequest) {
   type AgentUpdate = { id: string; [key: string]: unknown };
   const updates: AgentUpdate[] = [];
 
+  // Goals each agent has just marked complete (collected here, retired in one
+  // batched UPDATE after the loop so we don't fire one query per agent).
+  const completedGoalIds: string[] = [];
+
   for (let i = 0; i < aiDeciders.length; i++) {
     const agent = aiDeciders[i];
     const dr = decisionResults[i];
+
+    // Resolve completed_goal_indices → goal IDs using the same ordered list
+    // the LLM saw (goalsByAgent is sorted by priority desc, then enumerated
+    // 1-based in the prompt).
+    if (dr.status === "fulfilled" && dr.value.completed_goal_indices?.length) {
+      const goalsForAgent = goalsByAgent.get(agent.id) ?? [];
+      for (const idx of dr.value.completed_goal_indices) {
+        const goal = goalsForAgent[idx - 1];
+        if (goal) completedGoalIds.push(goal.id);
+      }
+    }
 
     // Fallback: random wander if LLM failed
     if (dr.status === "rejected") {
@@ -479,8 +739,88 @@ export async function POST(req: NextRequest) {
       }
       // No valid target — idle briefly
       updates.push({ id: agent.id, path: null, next_decision_tick: newTick + 2 + rand(3), status: "idle", action_description: desc, action_emoji: emoji });
+      continue;
+    }
+
+    // ── Physical activity verbs ──────────────────────────────────────────
+    if (isActivityVerb(d.chosen_action)) {
+      const verb = d.chosen_action as ActivityVerb;
+      // Resolve the target object. LLM specifies id; if invalid or omitted,
+      // fall back to the nearest valid object of that verb.
+      let obj = d.target_object ? getObject(d.target_object) : undefined;
+      if (!obj || obj.verb !== verb) {
+        obj = nearestObjectForVerb(verb, agent.current_x, agent.current_y);
+      }
+      if (!obj) {
+        // Shouldn't happen for any verb in WORLD_OBJECTS, but be safe.
+        updates.push({ id: agent.id, path: null, next_decision_tick: newTick + 2, status: "idle", action_description: desc, action_emoji: emoji });
+        continue;
+      }
+      // Role lock — only named agent(s) can fire this verb here. Player is
+      // exempt because the player UI bypasses this whole decision path.
+      if (obj.roleLock) {
+        const allowed = Array.isArray(obj.roleLock) ? obj.roleLock : [obj.roleLock];
+        if (!allowed.includes(agent.name)) {
+          updates.push({ id: agent.id, path: null, next_decision_tick: newTick + 2, status: "idle", action_description: desc, action_emoji: emoji });
+          continue;
+        }
+      }
+      // Already AT the object? Start the activity immediately.
+      const atObject = agent.current_x === obj.x && agent.current_y === obj.y;
+      if (atObject) {
+        const duration = VERB_TUNING[verb].durationTicks;
+        updates.push({
+          id: agent.id,
+          path: null,
+          status: "doing_activity",
+          current_activity_verb: verb,
+          current_activity_target: obj.id,
+          action_description: desc,
+          action_emoji: emoji,
+          next_decision_tick: newTick + duration,
+        });
+        continue;
+      }
+      // Otherwise walk there; the move loop transitions to doing_activity on arrival.
+      const path = findPath(
+        { x: agent.current_x, y: agent.current_y },
+        { x: obj.x, y: obj.y },
+        tilemap.width, tilemap.height,
+        (x, y) => tilemap.collision[y][x] === 1,
+      );
+      if (path) {
+        updates.push({
+          id: agent.id,
+          path,
+          status: "walking",
+          current_activity_verb: verb,
+          current_activity_target: obj.id,
+          action_description: desc || `${agent.name} heads toward ${obj.name}.`,
+          action_emoji: emoji || "🚶",
+        });
+        continue;
+      }
+      // No path — give up this tick.
+      updates.push({ id: agent.id, path: null, next_decision_tick: newTick + 2, status: "idle", action_description: desc, action_emoji: emoji });
     }
   }
+
+  // ── Retire completed goals in a single batched query ─────────────────────
+  if (completedGoalIds.length > 0) {
+    await supabase.from("goals")
+      .update({ status: "completed", completed_at_tick: newTick })
+      .in("id", completedGoalIds);
+  }
+
+  // ── Auto-abandon stale goals so the list never grows unbounded ───────────
+  // Active goals older than 80 ticks (~ one game day) without being touched
+  // are abandoned. The LLM is asked to retire goals voluntarily, but it's
+  // often cautious — this is the safety net that keeps the goal list clean.
+  const STALE_THRESHOLD_TICKS = 80;
+  await supabase.from("goals")
+    .update({ status: "abandoned", completed_at_tick: newTick })
+    .eq("status", "active")
+    .lt("created_at_tick", newTick - STALE_THRESHOLD_TICKS);
 
   // ── Conversation pipeline ─────────────────────────────────────────────────
   const agentByName = new Map(agents.map((a) => [a.name, a]));
@@ -572,9 +912,15 @@ export async function POST(req: NextRequest) {
     if (settled.status === "rejected") { console.error("Conversation failed:", settled.reason); continue; }
     const { agentA, agentB, result } = settled.value;
 
-    const convoInsert = supabase.from("conversations").insert({
+    // Persist the transcript. Previously this was built but never awaited,
+    // which meant the Supabase thenable never fired — every conversation
+    // since the world was init'd was generated, displayed, then dropped.
+    // The relationships + memory-summary writes still ran, which is why the
+    // bug stayed hidden until the inspector tried to read this table back.
+    const { error: convoErr } = await supabase.from("conversations").insert({
       agent_a_id: agentA.id, agent_b_id: agentB.id, sim_tick: newTick, turns: result.turns,
     });
+    if (convoErr) console.error("Conversation insert error:", convoErr.message);
 
     convoSummaries.push({
       agentAId: agentA.id, agentBId: agentB.id,
@@ -625,8 +971,6 @@ export async function POST(req: NextRequest) {
       { id: agentA.id, path: null, next_decision_tick: newTick + 2 + rand(3), status: "idle", action_emoji: "💬", action_description: `${agentA.name} just finished talking with ${agentB.name}` },
       { id: agentB.id, path: null, next_decision_tick: newTick + 2 + rand(3), status: "idle", action_emoji: "💬", action_description: `${agentB.name} just finished talking with ${agentA.name}` },
     );
-
-    void convoInsert;
   }
 
   // ── Persist memories ──────────────────────────────────────────────────────
@@ -660,7 +1004,7 @@ export async function POST(req: NextRequest) {
           user: mems.map((m) => `[${m.type}] ${m.content}`).join("\n"),
           schema: ReflectionSchema,
           temperature: 0.85,
-          maxTokens: 150,
+          maxTokens: 400,
         });
 
         await supabase.from("memories").insert({
@@ -679,7 +1023,7 @@ export async function POST(req: NextRequest) {
               user: reflection.reflections.join(" "),
               schema: GoalSchema,
               temperature: 0.8,
-              maxTokens: 120,
+              maxTokens: 300,
             });
             await supabase.from("goals").insert({
               agent_id: agent.id, description: goal.description, priority: goal.priority,
@@ -699,7 +1043,7 @@ export async function POST(req: NextRequest) {
 
   // ── Return fresh data ─────────────────────────────────────────────────────
   const { data: freshAgents } = await supabase.from("agents")
-    .select("id, name, sprite_key, current_x, current_y, current_building, status, is_sleeping, action_emoji, action_description")
+    .select("id, name, sprite_key, current_x, current_y, current_building, status, is_sleeping, action_emoji, action_description, hunger, energy, current_activity_verb, current_activity_target")
     .order("name");
 
   return NextResponse.json({

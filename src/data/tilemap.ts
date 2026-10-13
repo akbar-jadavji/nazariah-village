@@ -85,21 +85,57 @@ export function generateTileMap(): TileMap {
   fillRect(ground, 42, 36, 8, 3, TILE_GRASS_DARK);
 
   // ── Building definitions ─────────────────────────────────────────────────
+  // `rooms` is purely descriptive — it enriches LLM prompts so agents know
+  // what sub-areas exist inside each building (kitchen vs. bar vs. guest
+  // rooms, etc.). No per-room tile data; agents share one current_building.
   const buildingEntries: BuildingEntry[] = [
     { id: BLDG_INN, name: "The Enchanted Hearth", description: "A warm tavern with a crackling fireplace",
-      x: 2, y: 14, width: 3, height: 3, entryX: 3, entryY: 17 },
+      x: 2, y: 14, width: 3, height: 3, entryX: 3, entryY: 17,
+      rooms: [
+        { name: "Main Hall", description: "bar counter, crackling fireplace, four tables" },
+        { name: "Kitchen", description: "stove, pantry, a back door for deliveries" },
+        { name: "Guest Rooms", description: "two small rooms with beds upstairs" },
+      ] },
     { id: BLDG_APOTHECARY, name: "Moonpetal Apothecary", description: "Shelves lined with glowing bottles and dried herbs",
-      x: 12, y: 14, width: 3, height: 3, entryX: 13, entryY: 17 },
+      x: 12, y: 14, width: 3, height: 3, entryX: 13, entryY: 17,
+      rooms: [
+        { name: "Shop Floor", description: "counter, drying racks, jars of remedies" },
+        { name: "Workshop", description: "cauldron, mortar and pestle, herb worktable" },
+        { name: "Patient Cot", description: "a corner for treating the injured" },
+      ] },
     { id: BLDG_LIBRARY, name: "The Gilded Quill", description: "Towering bookshelves with ladders and a reading nook",
-      x: 8, y: 2, width: 3, height: 3, entryX: 9, entryY: 5 },
+      x: 8, y: 2, width: 3, height: 3, entryX: 9, entryY: 5,
+      rooms: [
+        { name: "Reading Nook", description: "a worn armchair, a writing desk, an oil lamp" },
+        { name: "Stacks", description: "tall shelves with ladders, scrolls of monster lore" },
+      ] },
     { id: BLDG_PLAZA, name: "Starfall Plaza", description: "An open cobblestone area with a crescent moon fountain",
-      x: 17, y: 17, width: 6, height: 6, entryX: 20, entryY: 20 },
+      x: 17, y: 17, width: 6, height: 6, entryX: 20, entryY: 20,
+      rooms: [
+        { name: "Fountain", description: "the crescent moon fountain at the plaza's center" },
+        { name: "Notice Board", description: "where village postings and jobs are pinned" },
+        { name: "Benches", description: "stone benches under a leaning lamppost" },
+      ] },
     { id: BLDG_PARK, name: "Eldergrove Park", description: "A quiet grove of ancient trees with stone benches",
-      x: 27, y: 2, width: 5, height: 5, entryX: 29, entryY: 7 },
+      x: 27, y: 2, width: 5, height: 5, entryX: 29, entryY: 7,
+      rooms: [
+        { name: "Pond", description: "the lily-pad pond where children skip stones" },
+        { name: "Old Tree", description: "a centuries-old oak with carved initials" },
+        { name: "Benches", description: "weathered stone benches in the shade" },
+      ] },
     { id: BLDG_BAKERY, name: "Hearthstone Bakery", description: "A cozy shop with flour-dusted counters",
-      x: 2, y: 7, width: 3, height: 3, entryX: 3, entryY: 10 },
+      x: 2, y: 7, width: 3, height: 3, entryX: 3, entryY: 10,
+      rooms: [
+        { name: "Bakery Front", description: "the bread oven, display shelf, baking counter" },
+        { name: "Back Pantry", description: "flour sacks, grain bins, the morning's dough" },
+      ] },
     { id: BLDG_WORKSHOP, name: "The Wanderer's Workshop", description: "A cluttered workspace with tools and strange contraptions",
-      x: 12, y: 7, width: 3, height: 3, entryX: 13, entryY: 10 },
+      x: 12, y: 7, width: 3, height: 3, entryX: 13, entryY: 10,
+      rooms: [
+        { name: "Forge Corner", description: "anvil, forge, hammer rack" },
+        { name: "Workbench", description: "scattered with half-finished gadgets and tools" },
+        { name: "Storage", description: "ingots, lumber, finished orders" },
+      ] },
     // Original cottages — bottom-left cluster
     { id: BLDG_COTTAGE_1, name: "Aldric House", description: "The innkeeper's family home",
       x: 25, y: 32, width: 2, height: 2, entryX: 25, entryY: 34 },

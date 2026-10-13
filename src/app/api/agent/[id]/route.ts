@@ -15,7 +15,7 @@ export async function GET(
   const supabase = serverClient();
 
   const [agentRes, memoriesRes, goalsRes, relsRes] = await Promise.all([
-    supabase.from("agents").select("*").eq("id", id).single(),
+    supabase.from("agents").select("*").eq("id", id).single(), // includes new hunger/energy/activity fields automatically
     supabase
       .from("memories")
       .select("type, content, sim_tick, importance")
@@ -30,7 +30,7 @@ export async function GET(
       .order("priority", { ascending: false }),
     supabase
       .from("relationships")
-      .select("target_id, familiarity, sentiment, summary, interaction_count")
+      .select("target_id, target_name_override, familiarity, sentiment, summary, interaction_count")
       .eq("agent_id", id)
       .order("familiarity", { ascending: false })
       .limit(6),
@@ -39,7 +39,9 @@ export async function GET(
   if (agentRes.error)
     return NextResponse.json({ error: agentRes.error.message }, { status: 404 });
 
-  // Resolve relationship target names
+  // Resolve relationship target names. Player relationships use the nil-UUID
+  // ("00000000-0000-0000-0000-000000000000") and carry the player's name in
+  // target_name_override; everyone else gets joined against the agents table.
   const targetIds = (relsRes.data ?? []).map((r) => r.target_id);
   let targetNames: Record<string, string> = {};
   if (targetIds.length > 0) {
@@ -56,7 +58,7 @@ export async function GET(
     goals: goalsRes.data ?? [],
     relationships: (relsRes.data ?? []).map((r) => ({
       ...r,
-      targetName: targetNames[r.target_id] ?? "Unknown",
+      targetName: r.target_name_override ?? targetNames[r.target_id] ?? "Unknown",
     })),
   });
 }

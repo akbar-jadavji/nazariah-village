@@ -17,6 +17,8 @@ import { serverClient, AgentRow } from "@/lib/supabase";
 import { generateTileMap } from "@/data/tilemap";
 import { findPath } from "@/engine/pathfinding";
 import { BUILDING_ID_TO_KEY, ENTERABLE_BUILDING_IDS } from "@/engine/buildings";
+import { getObject, VERB_TUNING, buildStateDetail } from "@/data/world-objects";
+import type { ActivityVerb } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const maxDuration = 10;
@@ -62,7 +64,7 @@ export async function POST(req: NextRequest) {
   if (!sim || sim.is_paused) {
     const { data: agents } = await supabase
       .from("agents")
-      .select("id, name, sprite_key, current_x, current_y, current_building, status, is_sleeping, action_emoji, action_description")
+      .select("id, name, sprite_key, current_x, current_y, current_building, status, is_sleeping, action_emoji, action_description, hunger, energy, current_activity_verb, current_activity_target")
       .order("name");
     return NextResponse.json({ agents: agents ?? [], skipped: true });
   }
@@ -123,13 +125,28 @@ export async function POST(req: NextRequest) {
       path = path.slice(1);
 
       if (path.length === 0) {
-        // Arrived — check if we can enter a building
-        const entry = tilemap.buildingEntries.find(
-          (b) => b.entryX === cx && b.entryY === cy && ENTERABLE_BUILDING_IDS.has(b.id),
-        );
-        if (entry && Math.random() < 0.5) {
-          enteredBuilding = BUILDING_ID_TO_KEY[entry.id] ?? String(entry.id);
-          occupancy.delete(nextKey);
+        // Arrived. Check the agent's intent in priority order:
+        //
+        //   1. If they're walking to a specific activity target object whose
+        //      tile we've just landed on, the activity check downstream will
+        //      handle it. DON'T pull them into the building's passive
+        //      "resting" branch — that would skip the verb entirely.
+        //
+        //   2. Otherwise (no activity, or they overshot), keep the legacy
+        //      50% "drift into the inn" behaviour so the village still
+        //      feels populated when agents wander past doors.
+        const targetObj = agent.current_activity_verb && agent.current_activity_target
+          ? getObject(agent.current_activity_target)
+          : undefined;
+        const arrivedAtActivityTarget = targetObj && targetObj.x === cx && targetObj.y === cy;
+        if (!arrivedAtActivityTarget) {
+          const entry = tilemap.buildingEntries.find(
+            (b) => b.entryX === cx && b.entryY === cy && ENTERABLE_BUILDING_IDS.has(b.id),
+          );
+          if (entry && Math.random() < 0.5) {
+            enteredBuilding = BUILDING_ID_TO_KEY[entry.id] ?? String(entry.id);
+            occupancy.delete(nextKey);
+          }
         }
         break;
       }
@@ -144,16 +161,60 @@ export async function POST(req: NextRequest) {
         path: null,
         next_decision_tick: currentTick + 4 + rand(8),
         status: "resting",
+        // Defensive: if an agent abandoned an in-flight activity to drift
+        // into a building, clear the intent so it doesn't linger and
+        // confuse the next decision.
+        current_activity_verb: null,
+        current_activity_target: null,
       });
     } else if (path.length === 0) {
-      updates.push({
-        id: agent.id,
-        current_x: cx,
-        current_y: cy,
-        path: null,
-        next_decision_tick: 0,
-        status: "idle",
-      });
+      // Path complete — but if this agent was walking toward an activity
+      // target, transition straight into doing_activity instead of going idle.
+      // The target object is identified by current_activity_target; we verify
+      // its tile matches arrival to guard against stale state.
+      const targetObj = agent.current_activity_verb && agent.current_activity_target
+        ? getObject(agent.current_activity_target)
+        : undefined;
+      const arrivedAtActivity = targetObj
+        && targetObj.x === cx && targetObj.y === cy
+        && agent.current_activity_verb === targetObj.verb;
+      if (arrivedAtActivity) {
+        const duration = VERB_TUNING[agent.current_activity_verb as ActivityVerb].durationTicks;
+        updates.push({
+          id: agent.id,
+          current_x: cx,
+          current_y: cy,
+          path: null,
+          status: "doing_activity",
+          // Activity will complete after this many ticks; tick endpoint handles it.
+          next_decision_tick: currentTick + duration,
+          action_description: `${agent.name} is ${agent.current_activity_verb}ing at ${targetObj.name}.`,
+        });
+        // Object state: flip to the object's `duringAction` state so OTHER
+        // agents passing by see "Bakery Oven: baking" in their observation.
+        if (targetObj.states?.duringAction) {
+          const detail = buildStateDetail(targetObj.kind, targetObj.states.duringAction, agent.name);
+          await supabase.from("object_states").upsert({
+            object_id: targetObj.id,
+            state: targetObj.states.duringAction,
+            state_detail: detail,
+            last_actor_id: agent.id,
+            last_updated_tick: currentTick,
+          }, { onConflict: "object_id" });
+        }
+      } else {
+        updates.push({
+          id: agent.id,
+          current_x: cx,
+          current_y: cy,
+          path: null,
+          next_decision_tick: 0,
+          status: "idle",
+          // Walking-to-activity got interrupted (object missing/moved) — clear it.
+          current_activity_verb: null,
+          current_activity_target: null,
+        });
+      }
     } else {
       updates.push({
         id: agent.id,
@@ -197,11 +258,20 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Return lean position data for canvas
-  const { data: freshAgents } = await supabase
-    .from("agents")
-    .select("id, name, sprite_key, current_x, current_y, current_building, status, is_sleeping, action_emoji, action_description")
-    .order("name");
+  // Return lean position data for canvas. Object states ride along so the
+  // client can render state-aware sprites (oven baking/ready vs. cold).
+  const [{ data: freshAgents }, { data: freshObjectStates }] = await Promise.all([
+    supabase
+      .from("agents")
+      .select("id, name, sprite_key, current_x, current_y, current_building, status, is_sleeping, action_emoji, action_description, hunger, energy, current_activity_verb, current_activity_target")
+      .order("name"),
+    supabase
+      .from("object_states")
+      .select("object_id, state, state_detail"),
+  ]);
 
-  return NextResponse.json({ agents: freshAgents ?? [] });
+  return NextResponse.json({
+    agents: freshAgents ?? [],
+    objectStates: freshObjectStates ?? [],
+  });
 }

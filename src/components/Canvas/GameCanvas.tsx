@@ -7,7 +7,9 @@ import {
   Direction, Player, TileMap,
 } from "@/lib/types";
 import { generateTileMap } from "@/data/tilemap";
-import { drawGroundTile, drawObject, drawBuilding, drawCharacter } from "@/engine/sprites";
+import { drawGroundTile, drawObject, drawBuilding, drawCharacter, drawInteractable } from "@/engine/sprites";
+import { WORLD_OBJECTS, objectAtOrNear, VERB_TUNING, getObject } from "@/data/world-objects";
+import type { InteractableObject, ActivityVerb } from "@/lib/types";
 import { isPassable } from "@/engine/world";
 
 const CANVAS_PIXEL_W = MAP_WIDTH * TILE_SIZE;  // 60×32 = 1920
@@ -60,6 +62,10 @@ type AgentServer = {
   status?: string;
   action_emoji?: string | null;
   action_description?: string | null;
+  hunger?: number;
+  energy?: number;
+  current_activity_verb?: string | null;
+  current_activity_target?: string | null;
 };
 
 type ConvoTurn = { speaker: string; speakerId: string; line: string; thought: string };
@@ -89,6 +95,19 @@ type AgentBound = {
 type MemoryEntry = { type: string; content: string; sim_tick: number; importance: number };
 type GoalEntry = { id: string; description: string; priority: number; status: string; steps: unknown; created_at_tick: number };
 type RelEntry = { target_id: string; targetName: string; familiarity: number; sentiment: number; summary: string | null; interaction_count: number };
+
+// ConvoTurn is already declared further up the file (live-chat overlay) — reuse it.
+type ConvoEntry = {
+  id: string;
+  otherId: string | null;
+  otherName: string;
+  isPlayerChat: boolean;
+  sim_tick: number;
+  day: number;
+  time_of_day: "morning" | "midday" | "afternoon" | "evening" | "night";
+  turns: ConvoTurn[];
+  created_at: string;
+};
 
 type InspectorData = {
   agent: {
@@ -128,6 +147,9 @@ export default function GameCanvas() {
   const animTimerRef = useRef(0);
   const groundCacheRef = useRef<HTMLCanvasElement | null>(null);
   const agentsRef = useRef<AgentRender[]>([]);
+  // Live object state from the move-loop poll. Keyed by object id; absent
+  // means "default state" (sprite uses obj.states?.default).
+  const objectStatesRef = useRef<Map<string, { state: string; state_detail: string | null }>>(new Map());
   const tickIntervalMsRef = useRef<number>(SPEED_INTERVALS_MS[1]);
   const lastTickCompletedAtRef = useRef<number>(0);
   const tickingRef = useRef(false);
@@ -151,6 +173,11 @@ export default function GameCanvas() {
   const [inspectorId, setInspectorId] = useState<string | null>(null);
   const [inspectorData, setInspectorData] = useState<InspectorData | null>(null);
   const [inspectorLoading, setInspectorLoading] = useState(false);
+  // Conversation history is lazy-loaded — most inspector opens don't need it.
+  const [convoOpen, setConvoOpen] = useState(false);
+  const [convoLoading, setConvoLoading] = useState(false);
+  const [convoData, setConvoData] = useState<ConvoEntry[] | null>(null);
+  const [expandedConvoId, setExpandedConvoId] = useState<string | null>(null);
 
   const [simState, setSimState] = useState<SimState | null>(null);
   const [speed, setSpeed] = useState<number>(1);
@@ -164,6 +191,32 @@ export default function GameCanvas() {
   const [showSetup, setShowSetup] = useState(false);
   const [setupNameDraft, setSetupNameDraft] = useState("");
   const [setupColorDraft, setSetupColorDraft] = useState("#4060c0");
+
+  // ── Player body state ────────────────────────────────────────────────────
+  // Mirrors agents' hunger/energy. Drifts naturally; activities restore. The
+  // numbers are display-only — they don't affect anything mechanically yet,
+  // but they make object interactions meaningful instead of just flavour.
+  const [playerHunger, setPlayerHunger] = useState(40);
+  const [playerEnergy, setPlayerEnergy] = useState(70);
+  const playerHungerRef = useRef(40);
+  const playerEnergyRef = useRef(70);
+  useEffect(() => { playerHungerRef.current = playerHunger; }, [playerHunger]);
+  useEffect(() => { playerEnergyRef.current = playerEnergy; }, [playerEnergy]);
+
+  // ── Player active interaction with a world object ────────────────────────
+  // While set, the player can't move and a progress bar shows above them.
+  // Real-time duration (seconds) is roughly proportional to a verb's tick
+  // duration but capped so it never feels long.
+  type PlayerActivity = {
+    verb: ActivityVerb;
+    objectId: string;
+    objectName: string;
+    startedAt: number;       // performance.now()
+    durationMs: number;
+  };
+  const [playerActivity, setPlayerActivity] = useState<PlayerActivity | null>(null);
+  const playerActivityRef = useRef<PlayerActivity | null>(null);
+  useEffect(() => { playerActivityRef.current = playerActivity; }, [playerActivity]);
 
   // ── Player chat ───────────────────────────────────────────────────────────
   const [chatAgentId, setChatAgentId] = useState<string | null>(null);
@@ -385,6 +438,13 @@ export default function GameCanvas() {
         const elapsed = prev > 0 ? now - prev : 300;
         lastTickCompletedAtRef.current = now;
         mergeAgents(data.agents ?? [], now, Math.min(elapsed, 300));
+        // Update object states for the renderer + interact hint.
+        const states = data.objectStates as { object_id: string; state: string; state_detail: string | null }[] | undefined;
+        if (Array.isArray(states)) {
+          const m = new Map<string, { state: string; state_detail: string | null }>();
+          for (const s of states) m.set(s.object_id, { state: s.state, state_detail: s.state_detail });
+          objectStatesRef.current = m;
+        }
       } catch { /* non-fatal */ }
     };
     const id = setInterval(runMove, 300);
@@ -475,6 +535,29 @@ export default function GameCanvas() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatMessages]);
 
+  // ── Player body state: drift + activity completion ─────────────────────
+  // Runs on a 1 s real-time interval. Hunger creeps up, energy creeps down,
+  // and any in-flight player activity that has passed its duration applies
+  // its VERB_TUNING delta and clears itself.
+  useEffect(() => {
+    const id = setInterval(() => {
+      // Drift (skip while in an activity — body state is "paused" during it).
+      if (!playerActivityRef.current) {
+        setPlayerHunger((h) => Math.min(100, h + 1));
+        setPlayerEnergy((e) => Math.max(0, e - 1));
+      }
+      // Activity completion.
+      const activity = playerActivityRef.current;
+      if (activity && performance.now() - activity.startedAt >= activity.durationMs) {
+        const tuning = VERB_TUNING[activity.verb];
+        setPlayerHunger((h) => Math.max(0, Math.min(100, h + tuning.hungerDelta)));
+        setPlayerEnergy((e) => Math.max(0, Math.min(100, e + tuning.energyDelta)));
+        setPlayerActivity(null);
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+
   // Keyboard input
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -490,13 +573,16 @@ export default function GameCanvas() {
         return;
       }
 
+      // E — pure chat affordance. Open a chat with the nearest agent, or
+      // close one that's already open. Object interaction is on Q (below)
+      // so the two don't compete when the player is standing between an
+      // agent and an interactable.
       if (key === "e") {
         if (chatAgentIdRef.current) {
           setChatAgentId(null);
           chatAgentIdRef.current = null;
           return;
         }
-        // Find nearest agent within TALK_RADIUS
         const player = playerRef.current;
         let nearest: AgentRender | null = null;
         let minD = Infinity;
@@ -514,6 +600,31 @@ export default function GameCanvas() {
           setChatAgentName(nearest.name);
           setChatMessages([]);
           setChatInput("");
+        }
+        return;
+      }
+
+      // Q — interact with the world object the player is adjacent to.
+      // Pressing Q during an activity cancels it. Player can chat AND keep
+      // their object hint visible at the same time — no contention.
+      if (key === "q") {
+        if (playerActivityRef.current) {
+          setPlayerActivity(null);
+          return;
+        }
+        const player = playerRef.current;
+        const obj = objectAtOrNear(player.position.x, player.position.y, 1);
+        if (obj) {
+          // Map verb-duration (ticks, simulation time) to a real-time feel.
+          // 1 tick ≈ 2.5 seconds for the player so even sleep is bearable.
+          const durationMs = Math.max(2500, VERB_TUNING[obj.verb].durationTicks * 2500);
+          setPlayerActivity({
+            verb: obj.verb,
+            objectId: obj.id,
+            objectName: obj.name,
+            startedAt: performance.now(),
+            durationMs,
+          });
         }
         return;
       }
@@ -553,6 +664,13 @@ export default function GameCanvas() {
 
     player.visualX = player.position.x;
     player.visualY = player.position.y;
+
+    // While the player is mid-activity (praying / sleeping / etc.) they're
+    // locked in place — same affordance agents get. Press Q again to cancel.
+    if (playerActivityRef.current) {
+      player.isMoving = false;
+      return;
+    }
 
     const keys = keysRef.current;
     let dir: Direction | null = null;
@@ -639,6 +757,23 @@ export default function GameCanvas() {
         drawables.push({
           y: entry.y + entry.height - 1,
           draw: () => drawBuilding(ctx, entry.id, entry.x, entry.y, entry.width, entry.height, entry.entryX, entry.entryY),
+        });
+      }
+
+      // Interactable world objects (altar, bookshelves, beds, etc.). Y-sorted
+      // alongside agents so things layer correctly. The closest object to the
+      // player gets a glow outline as a "press E to interact" affordance.
+      const playerPos = playerRef.current.position;
+      const nearbyForPlayer = objectAtOrNear(playerPos.x, playerPos.y, 1);
+      const liveStates = objectStatesRef.current;
+      for (const obj of WORLD_OBJECTS) {
+        const highlighted = obj.id === nearbyForPlayer?.id;
+        // Server-known state, falling back to the object's default for
+        // sprite selection when no row exists yet.
+        const liveState = liveStates.get(obj.id)?.state ?? obj.states?.default;
+        drawables.push({
+          y: obj.y,
+          draw: () => drawInteractable(ctx, obj, highlighted, liveState),
         });
       }
 
@@ -912,17 +1047,41 @@ export default function GameCanvas() {
     }
   }, [selectedConvoIdx, logOpen]);
 
-  // Fetch agent detail when inspector opens
+  // Fetch agent detail when inspector opens. Also resets the lazy-loaded
+  // conversation history so a new agent doesn't briefly show the previous
+  // agent's chats while the new ones load.
   useEffect(() => {
-    if (!inspectorId) { setInspectorData(null); return; }
+    if (!inspectorId) {
+      setInspectorData(null);
+      setConvoOpen(false);
+      setConvoData(null);
+      setExpandedConvoId(null);
+      return;
+    }
     setInspectorLoading(true);
     setInspectorData(null);
+    setConvoOpen(false);
+    setConvoData(null);
+    setExpandedConvoId(null);
     fetch(`/api/agent/${inspectorId}`)
       .then((r) => r.json())
       .then((d) => setInspectorData(d))
       .catch(() => {})
       .finally(() => setInspectorLoading(false));
   }, [inspectorId]);
+
+  // Open + lazy-fetch the conversation history pane.
+  const openConversationHistory = useCallback(() => {
+    if (!inspectorId) return;
+    setConvoOpen(true);
+    if (convoData !== null) return; // already loaded
+    setConvoLoading(true);
+    fetch(`/api/agent/${inspectorId}/conversations`)
+      .then((r) => r.json())
+      .then((d) => setConvoData(d.conversations ?? []))
+      .catch(() => setConvoData([]))
+      .finally(() => setConvoLoading(false));
+  }, [inspectorId, convoData]);
 
   // Confirm player setup
   const confirmSetup = useCallback(() => {
@@ -1140,10 +1299,27 @@ export default function GameCanvas() {
           }}
           tabIndex={0}
         />
+
+        {/* ── HUD: hunger + energy bars (top-left) ─────────────────────── */}
+        <PlayerHud hunger={playerHunger} energy={playerEnergy} />
+
+        {/* ── "Press Q to ..." hint when near an interactable object */}
+        <InteractHint
+          playerX={playerRef.current.position.x}
+          playerY={playerRef.current.position.y}
+          finalScale={finalScale}
+        />
+
+        {/* ── Player activity progress overlay ─────────────────────────── */}
+        {playerActivity && (
+          <PlayerActivityOverlay
+            activity={playerActivity}
+          />
+        )}
       </div>
 
       <p className="text-xs text-gray-500 mt-2 font-mono">
-        Nazariah · 25 villagers · Move loop 300 ms · Think loop 5 s · Press E to chat · Click agent to inspect
+        Nazariah · 25 villagers · WASD move · E chat · Q interact · Click agent to inspect
       </p>
 
       {/* Conversation log panel */}
@@ -1466,6 +1642,74 @@ export default function GameCanvas() {
                       ))}
                     </div>
                   )}
+
+                  {/* Conversation History — lazy-loaded */}
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-gray-300 font-bold">Conversation History</div>
+                      <button
+                        onClick={convoOpen ? () => setConvoOpen(false) : openConversationHistory}
+                        className="text-gray-400 hover:text-amber-200 text-xs px-2 py-0.5 rounded border border-gray-700 hover:border-amber-700"
+                      >
+                        {convoOpen ? "Hide" : "Show all"}
+                      </button>
+                    </div>
+                    {convoOpen && (
+                      convoLoading ? (
+                        <div className="text-gray-600 italic">Loading…</div>
+                      ) : !convoData || convoData.length === 0 ? (
+                        <div className="text-gray-600 italic">No conversations yet</div>
+                      ) : (
+                        <div className="space-y-1.5">
+                          {convoData.map((c) => {
+                            const isExpanded = expandedConvoId === c.id;
+                            const firstLine = c.turns[0]?.line ?? "";
+                            return (
+                              <div key={c.id} className="bg-gray-800 rounded-lg overflow-hidden">
+                                <button
+                                  onClick={() =>
+                                    setExpandedConvoId(isExpanded ? null : c.id)
+                                  }
+                                  className="w-full p-2.5 text-left hover:bg-gray-700/50 flex flex-col gap-1"
+                                >
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="text-amber-200 text-xs font-bold truncate flex items-center gap-1">
+                                      {c.isPlayerChat && (
+                                        <span className="px-1 py-0.5 bg-sky-900 text-sky-200 rounded text-[10px] leading-none">
+                                          you
+                                        </span>
+                                      )}
+                                      with {c.otherName}
+                                    </span>
+                                    <span className="text-gray-500 text-xs flex-shrink-0">
+                                      Day {c.day} · {c.time_of_day} · {c.turns.length} turn{c.turns.length === 1 ? "" : "s"}
+                                    </span>
+                                  </div>
+                                  {!isExpanded && firstLine && (
+                                    <div className="text-gray-400 text-xs italic truncate">
+                                      “{firstLine}”
+                                    </div>
+                                  )}
+                                </button>
+                                {isExpanded && (
+                                  <div className="px-3 pb-3 space-y-1.5 border-t border-gray-700/60 pt-2">
+                                    {c.turns.map((t, ti) => (
+                                      <div key={ti} className="text-xs leading-snug">
+                                        <span className="text-gray-300 font-bold mr-1">
+                                          {t.speaker}:
+                                        </span>
+                                        <span className="text-gray-400">{t.line}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )
+                    )}
+                  </div>
                 </div>
               </>
             )}
@@ -1475,3 +1719,93 @@ export default function GameCanvas() {
     </div>
   );
 }
+
+// ── HUD components ──────────────────────────────────────────────────────────
+
+/** Bottom-left of viewport: two compact bars, hunger and energy. */
+function PlayerHud({ hunger, energy }: { hunger: number; energy: number }) {
+  return (
+    <div className="absolute left-2 top-2 font-mono text-xs text-gray-100 bg-black/55 rounded px-2 py-1.5 space-y-1 pointer-events-none">
+      <div className="flex items-center gap-1.5">
+        <span className="w-4">🍞</span>
+        <div className="w-24 h-1.5 bg-gray-700 rounded overflow-hidden">
+          <div
+            className="h-full rounded"
+            style={{
+              width: `${100 - hunger}%`,
+              background: hunger >= 80 ? "#c44848" : hunger >= 60 ? "#d49830" : "#80a040",
+            }}
+          />
+        </div>
+      </div>
+      <div className="flex items-center gap-1.5">
+        <span className="w-4">⚡</span>
+        <div className="w-24 h-1.5 bg-gray-700 rounded overflow-hidden">
+          <div
+            className="h-full rounded"
+            style={{
+              width: `${energy}%`,
+              background: energy <= 20 ? "#c44848" : energy <= 40 ? "#d49830" : "#48a8d4",
+            }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Hint that appears near the player when they're adjacent to an interactable
+ * object and no agent is in chat range. Lets the player know E will do
+ * something useful here.
+ */
+function InteractHint({
+  playerX, playerY, finalScale,
+}: { playerX: number; playerY: number; finalScale: number }) {
+  const obj = objectAtOrNear(playerX, playerY, 1);
+  if (!obj) return null;
+  // Anchor the hint just above the player sprite (in canvas-px coords, then
+  // multiplied by the responsive scale).
+  const left = (playerX * TILE_SIZE + TILE_SIZE / 2) * finalScale;
+  const top  = (playerY * TILE_SIZE - 18) * finalScale;
+  return (
+    <div
+      className="absolute font-mono text-xs text-amber-200 bg-black/75 rounded px-2 py-0.5 pointer-events-none whitespace-nowrap"
+      style={{ left, top, transform: "translateX(-50%)" }}
+    >
+      [Q] {obj.verb} · {obj.name}
+    </div>
+  );
+}
+
+/** Full-viewport overlay that shows the player's current activity + progress. */
+function PlayerActivityOverlay({
+  activity,
+}: {
+  activity: { verb: ActivityVerb; objectName: string; startedAt: number; durationMs: number };
+}) {
+  const [now, setNow] = useState(performance.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(performance.now()), 100);
+    return () => clearInterval(id);
+  }, []);
+  const elapsed = now - activity.startedAt;
+  const progress = Math.min(1, elapsed / activity.durationMs);
+  return (
+    <div className="absolute inset-x-0 bottom-2 flex flex-col items-center pointer-events-none">
+      <div className="bg-black/75 rounded-md px-3 py-2 font-mono text-xs text-amber-100 flex items-center gap-2 min-w-[180px]">
+        <span className="capitalize">{activity.verb}</span>
+        <span className="text-gray-400">at {activity.objectName}</span>
+      </div>
+      <div className="w-44 h-1 bg-gray-700/80 rounded mt-1 overflow-hidden">
+        <div
+          className="h-full bg-amber-300"
+          style={{ width: `${progress * 100}%`, transition: "width 100ms linear" }}
+        />
+      </div>
+      <div className="text-[10px] text-gray-400 mt-0.5 font-mono">Press Q to cancel</div>
+    </div>
+  );
+}
+// Tiny helper used by InteractHint — keeps TILE_SIZE imports local.
+// (Already imported at the top of this file alongside MAP_WIDTH/HEIGHT.)

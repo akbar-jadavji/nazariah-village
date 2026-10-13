@@ -187,6 +187,224 @@ export function drawObject(ctx: CanvasRenderingContext2D, objId: number, x: numb
   }
 }
 
+// ── Interactable world objects (altar, bookshelves, bed, etc.) ──────────────
+import type { InteractableObject } from "@/lib/types";
+
+/**
+ * PNG sprite cache for interactable objects. The renderer will try the
+ * specific state file first (`/assets/objects/<kind>_<state>.png`) and fall
+ * back to the kind-only file (`<kind>.png`). If neither exists, the
+ * procedural drawer takes over.
+ *
+ * Cache values:
+ *   - HTMLImageElement: loaded successfully (use it)
+ *   - false           : 404'd, do not retry
+ *   - undefined       : not yet attempted
+ */
+const objectSpriteCache = new Map<string, HTMLImageElement | false>();
+
+function getObjectSprite(kind: string, state?: string): HTMLImageElement | null {
+  const keys = state ? [`${kind}_${state}`, kind] : [kind];
+  for (const key of keys) {
+    const cached = objectSpriteCache.get(key);
+    if (cached instanceof HTMLImageElement) return cached;
+    if (cached === false) continue; // known-missing; try next fallback
+    if (typeof window === "undefined") return null; // SSR safety
+    // Not attempted yet — kick off a load. We return null this frame; once
+    // it's in cache the next frame will pick it up.
+    const img = new Image();
+    img.onload = () => objectSpriteCache.set(key, img);
+    img.onerror = () => objectSpriteCache.set(key, false);
+    img.src = `/assets/objects/${key}.png`;
+    // Mark "pending" by NOT setting in the cache yet — that way we don't
+    // double-attempt; the onload/onerror will set the final value.
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Draw an interactable object on the canvas. Each kind has a small distinct
+ * sprite — agents and the player can spot what they're walking toward.
+ *
+ * If a PNG exists at /assets/objects/<kind>(_<state>).png, that gets blitted.
+ * Otherwise a procedural placeholder is drawn so the village always renders.
+ *
+ * Also draws a faint glow outline when `highlighted` is true (used when the
+ * player is close enough to interact).
+ */
+export function drawInteractable(
+  ctx: CanvasRenderingContext2D,
+  obj: InteractableObject,
+  highlighted = false,
+  currentState?: string,
+) {
+  const px = obj.x * TILE_SIZE;
+  const py = obj.y * TILE_SIZE;
+
+  if (highlighted) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(255, 220, 130, 0.9)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2);
+    ctx.restore();
+  }
+
+  // Try the PNG path first. If we get a real image back, blit and return.
+  const sprite = getObjectSprite(obj.kind, currentState);
+  if (sprite) {
+    ctx.drawImage(sprite, px, py, TILE_SIZE, TILE_SIZE);
+    return;
+  }
+
+  switch (obj.kind) {
+    case "altar": {
+      // Stone block with a lit candle on top.
+      ctx.fillStyle = "#6a6a78";
+      ctx.fillRect(px + 8, py + 16, 16, 12);
+      ctx.fillStyle = "#4a4a55";
+      ctx.fillRect(px + 8, py + 24, 16, 4);
+      // Candle
+      ctx.fillStyle = "#f0e8c8";
+      ctx.fillRect(px + 14, py + 6, 4, 10);
+      // Flame
+      ctx.fillStyle = "#f6c060";
+      ctx.fillRect(px + 14, py + 2, 4, 4);
+      ctx.fillStyle = "#ffeea0";
+      ctx.fillRect(px + 15, py + 3, 2, 2);
+      // Crescent etched on the front
+      ctx.fillStyle = "#aaa6b8";
+      ctx.fillRect(px + 13, py + 20, 6, 2);
+      break;
+    }
+    case "bookshelves": {
+      // Vertical wooden case with rows of colored book spines.
+      ctx.fillStyle = "#5a3a20";
+      ctx.fillRect(px + 4, py + 2, 24, 28);
+      ctx.fillStyle = "#3a2418";
+      ctx.fillRect(px + 4, py + 2, 24, 2); // top trim
+      ctx.fillRect(px + 4, py + 28, 24, 2); // bottom trim
+      // Books row 1
+      const colors = ["#c44848", "#4868c4", "#c4a448", "#48a448", "#a448c4"];
+      for (let row = 0; row < 3; row++) {
+        for (let i = 0; i < 5; i++) {
+          ctx.fillStyle = colors[(i + row) % colors.length];
+          ctx.fillRect(px + 5 + i * 5, py + 6 + row * 8, 4, 6);
+        }
+      }
+      break;
+    }
+    case "bed": {
+      // Brown frame, beige sheet, darker pillow on one end.
+      ctx.fillStyle = "#5a3a20";
+      ctx.fillRect(px + 2, py + 10, 28, 18);
+      ctx.fillStyle = "#d4c8a0";
+      ctx.fillRect(px + 4, py + 12, 24, 14);
+      // Pillow
+      ctx.fillStyle = "#f0e8d8";
+      ctx.fillRect(px + 4, py + 12, 8, 6);
+      // Blanket fold
+      ctx.fillStyle = "#a06848";
+      ctx.fillRect(px + 14, py + 18, 14, 8);
+      break;
+    }
+    case "wildflower_patch": {
+      // Cluster of small colored dots = flowers.
+      ctx.fillStyle = "#3a8030";
+      ctx.fillRect(px + 4, py + 24, 24, 6); // grass mat
+      const dots: [number, number, string][] = [
+        [8, 18, "#e6588c"],
+        [14, 14, "#f0c050"],
+        [20, 20, "#a06ad0"],
+        [24, 16, "#e6588c"],
+        [10, 22, "#f0c050"],
+        [18, 24, "#a0d050"],
+        [22, 26, "#a06ad0"],
+      ];
+      for (const [dx, dy, color] of dots) {
+        ctx.fillStyle = color;
+        ctx.fillRect(px + dx, py + dy, 3, 3);
+      }
+      break;
+    }
+    case "inn_bar": {
+      // Wooden bar counter with a tankard.
+      ctx.fillStyle = "#7a4a28";
+      ctx.fillRect(px + 2, py + 14, 28, 14);
+      ctx.fillStyle = "#5a3a18";
+      ctx.fillRect(px + 2, py + 14, 28, 3);
+      ctx.fillRect(px + 2, py + 26, 28, 2);
+      // Tankard
+      ctx.fillStyle = "#aaa6a0";
+      ctx.fillRect(px + 14, py + 8, 6, 10);
+      ctx.fillStyle = "#ddd8c8"; // foam
+      ctx.fillRect(px + 14, py + 8, 6, 2);
+      // Plate
+      ctx.fillStyle = "#e6e0d0";
+      ctx.fillRect(px + 22, py + 18, 6, 3);
+      break;
+    }
+    case "bench": {
+      // Reuse the bench look from OBJ_BENCH but slightly lighter so it
+      // reads as "interactable" vs the inert decorative ones.
+      ctx.fillStyle = "#8a6a3a";
+      ctx.fillRect(px + 4, py + 16, 24, 6);
+      ctx.fillStyle = "#6a4a20";
+      ctx.fillRect(px + 6, py + 22, 4, 8);
+      ctx.fillRect(px + 22, py + 22, 4, 8);
+      ctx.fillStyle = "#8a6a3a";
+      ctx.fillRect(px + 4, py + 10, 24, 4);
+      ctx.fillRect(px + 4, py + 10, 2, 12);
+      ctx.fillRect(px + 26, py + 10, 2, 12);
+      break;
+    }
+    case "oven": {
+      // Stone arch on the bottom; fire/glow + bread visible based on state.
+      // Base body
+      ctx.fillStyle = "#5a4a3a";
+      ctx.fillRect(px + 4, py + 6, 24, 22);
+      ctx.fillStyle = "#3a2a20";
+      ctx.fillRect(px + 4, py + 26, 24, 2);
+      // Arched mouth
+      ctx.fillStyle = "#1a0e08";
+      ctx.fillRect(px + 8, py + 12, 16, 12);
+      ctx.fillStyle = "#5a4a3a";
+      ctx.fillRect(px + 8, py + 12, 2, 4);
+      ctx.fillRect(px + 22, py + 12, 2, 4);
+      // Chimney
+      ctx.fillStyle = "#6a5a4a";
+      ctx.fillRect(px + 18, py + 2, 6, 6);
+
+      if (currentState === "baking") {
+        // Glow + smoke
+        ctx.fillStyle = "#f0a040";
+        ctx.fillRect(px + 11, py + 17, 10, 6);
+        ctx.fillStyle = "#ffd060";
+        ctx.fillRect(px + 13, py + 19, 6, 3);
+        // Smoke puffs
+        ctx.fillStyle = "rgba(220,210,200,0.6)";
+        ctx.fillRect(px + 19, py + 0, 4, 3);
+        ctx.fillRect(px + 21, py - 2, 4, 3);
+      } else if (currentState === "ready") {
+        // Embers + bread on a tray below the mouth
+        ctx.fillStyle = "#c44040";
+        ctx.fillRect(px + 12, py + 21, 8, 2);
+        // Three round loaves
+        ctx.fillStyle = "#c4965a";
+        ctx.fillRect(px + 6, py + 28, 6, 3);
+        ctx.fillRect(px + 14, py + 28, 6, 3);
+        ctx.fillRect(px + 22, py + 28, 6, 3);
+        ctx.fillStyle = "#a07840";
+        ctx.fillRect(px + 6, py + 30, 6, 1);
+        ctx.fillRect(px + 14, py + 30, 6, 1);
+        ctx.fillRect(px + 22, py + 30, 6, 1);
+      }
+      // cold: nothing extra — just the dark hearth
+      break;
+    }
+  }
+}
+
 // Building color schemes
 const BUILDING_STYLES: Record<number, { wall: string; roof: string; roofDark: string; accent: string }> = {
   [BLDG_INN]:        { wall: "#d4b88c", roof: "#a04040", roofDark: "#803030", accent: "#e08030" },
